@@ -1,0 +1,26 @@
+# WorkBuddy2API 反向代理示例（Caddy，单文件、自动 HTTPS）
+#
+# 比 Nginx 省事的地方：证书自动申请与续期、HTTP→HTTPS 自动跳转、
+# X-Forwarded-For / -Proto / -Host 默认就会带上，不用手写 header_up。
+#
+# 约束与前一份 nginx 配置相同 —— 见 deploy/nginx.conf.example 顶部说明：
+# 必须挂在 origin 根上、/panel/ 与 /trae/ 必须同源。
+
+wb2api.example.com {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:7863 {
+		# SSE 流式：flush_interval -1 = 每个 Write 立即下发，不做任何缓冲。
+		# （网关自己在响应上写了 X-Accel-Buffering: no，但那是给 Nginx 看的）
+		flush_interval -1
+
+		# 模型思考期间 SSE 可能长时间静默，别让反代先超时断流
+		transport http {
+			read_timeout  1h
+			write_timeout 1h
+		}
+	}
+
+	# 大上下文 / 文件块：Caddy 默认不限请求体，无需额外配置。
+	# 若要显式限制，用 request_body { max_size 64MB }
+}

@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,12 +28,20 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	// Trae（TRAE SOLO）侧：与 WorkBuddy 同源的姊妹实现，独立成套引入。
+	// 本地包名与它们同名（auth/pool/scheduler/server/upstream），一律加 trae 前缀别名。
+	traeauth "github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
+	traepool "github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
+	traescheduler "github.com/linguo2625469/workbuddy2api-panel/internal/trae/scheduler"
+	traeserver "github.com/linguo2625469/workbuddy2api-panel/internal/trae/server"
+	traeupstream "github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/tunnel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
+// appVersion 网关版本（fork 版：面板 + 任务体系 + Trae 双池 + 面板停机），透出到 /panel/api/overview。
+const appVersion = "1.19.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -176,14 +186,54 @@ func main() {
 	// DNS：Android 没有 /etc/resolv.conf，Go 的纯 Go 解析器会退回 127.0.0.1/::1，
 	// 于是查任何域名都变成"连本机 53 端口"（dial tcp: lookup copilot.tencent.com
 	// on [::1]:53: connection refused）。配了 dns_servers / WB2A_DNS 就显式指定。
+	// dnsDialer 提升到此处声明：Trae 侧要复用同一个拨号器，两侧出站解析口径一致。
+	var dnsDialer *net.Dialer
 	if len(cfg.DNSServers) > 0 {
-		d := upstream.NewDNSDialer(cfg.DNSServers)
-		up.SetDNSDialer(d)
+		dnsDialer = upstream.NewDNSDialer(cfg.DNSServers)
+		up.SetDNSDialer(dnsDialer)
 		// 推送 webhook / Upstash 镜像等走 http.DefaultTransport，一并换掉
 		if t, ok := http.DefaultTransport.(*http.Transport); ok {
-			t.DialContext = d.DialContext
+			t.DialContext = dnsDialer.DialContext
 		}
 		log.Printf("DNS: 出站解析用 %v（不走系统 /etc/resolv.conf）", cfg.DNSServers)
+	}
+	// 出站 ALPN：显式钉死 TLS 侧广告的应用协议，与 transport 侧「认识哪些协议」同调。
+	// 默认只广告 http/1.1（禁 h2）；若环境（中间盒 / VPN / 网关）无视 ALPN 径自按
+	// h2 回帧，用 config tls_alpn="h2" 切到 h2 档。必须在**任何出站请求之前**：
+	// ALPNH2 依赖标准库一次性注册 h2，而紧随其后的 startTLSAutoTrust 会立刻发探测。
+	alpnMode := upstream.ParseALPNMode(cfg.TLSALPN)
+	if up.SetALPNMode(alpnMode) {
+		if alpnMode == upstream.ALPNH2 {
+			log.Printf("TLS: 出站 ALPN 已切换到 h2（tls_alpn=h2）")
+		}
+	} else {
+		log.Printf("TLS: 出站 ALPN 未能切到 h2（transport 已初始化），仍按 http/1.1 出站")
+	}
+	panel.SetLoginALPN(alpnMode)
+	// 出站 TLS 信任：中间人代理（企业网关 / 抓包工具 / 手机 VPN 自签 CA）场景，
+	// 不配则完全保持原行为（标准库默认根池）。tls_ca_file 与系统根求并集；
+	// tls_insecure_skip_verify 才是跳过校验的最后手段。
+	tlsCfg, err := upstream.BuildTLSConfig(cfg.TLSCAFile, cfg.TLSInsecureSkipVerify)
+	if err != nil {
+		log.Fatalf("tls: %v", err)
+	}
+	if tlsCfg != nil {
+		up.SetTLSConfig(tlsCfg)
+		// 面板设备授权登录、推送 webhook、Upstash 镜像等走 http.DefaultTransport。
+		syncDefaultTransportTLS(tlsCfg, alpnMode)
+		panel.SetLoginClientTLS(tlsCfg)
+		if cfg.TLSInsecureSkipVerify {
+			log.Printf("TLS: 已跳过出站证书校验（tls_insecure_skip_verify）——仅应急/排障使用，存在中间人风险")
+		} else {
+			log.Printf("TLS: 出站信任池已并入自备 CA %s", cfg.TLSCAFile)
+		}
+	}
+	// 出站 TLS 自动修（config.tls_auto_trust，默认开启）：后台探测上游并信任其出示的
+	// 证书链，让「中间人代理导致全部出站失败」无需人工干预即可恢复；请求撞上证书
+	// 错误时还会现场再修一次并重试（见 internal/panel/tlsauto.go）。放在此处而非更早
+	// 是因为它依赖 DNS 拨号器与（可能的）tls_ca_file 都已接线完毕。
+	if cfg.TLSAutoTrust {
+		startTLSAutoTrust(cfg, up, *cfgPath)
 	}
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
@@ -258,6 +308,13 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 	})
+	// 公网隧道（Cloudflare Tunnel）：默认关，用户在面板打开才拉 cloudflared。
+	// 纯出站连接，不改本机网络配置——详见 internal/tunnel 的包注释。
+	tm := tunnel.New()
+	// Trae 实例在下面 setupTrae 才建好，但面板构造（panel.New）早于它、
+	// 又需要拿到它查模型 —— 所以在这里提前声明，让闭包捕获这个变量。
+	// 它在 HTTP 服务启动前就已赋值，之后只读，无数据竞争。
+	var traeRT *traeRuntime
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -282,6 +339,13 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// ctx/stop 提前到此处建立：面板「停止服务」直接传的就是这个 cancel 函数，
+	// 走与 Ctrl+C / SIGTERM 完全相同的优雅停机路径（pool.Flush 落盘 → srv.Shutdown）。
+	// 必须先于 panel.New —— 否则「面板已装配好」到「信号已注册」之间那段窗口里点停止
+	// 会静默无效（接口返回 200 但进程不退）。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -298,16 +362,32 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		// 面板「停止服务」：Shutdown 就是上面那个 cancel（与 Ctrl+C 同一条路径）；
+		// ShutdownMark 是给模块 watcher.sh 的停驻信号（空 = 无守护进程，无需信号）。
+		Shutdown:     stop,
+		ShutdownMark: cfg.ShutdownMarker,
+		Tunnel:       tm,
+		// Trae 模型并入「模型与档位」：闭包在请求时才读 traeRT（那时已装配完）。
+		TraeModels: func() ([]map[string]any, error) {
+			return traeModelsForPanel(traeRT)
+		},
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, tm)
 		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+
+	// 按当前配置决定是否拉起隧道。失败只记日志：隧道起不来不该让网关本身不可用，
+	// 具体原因会体现在面板「配置 → 远程访问」的 Err 上。
+	if err := tm.Apply(tunnelConfigFrom(cfg)); err != nil {
+		log.Printf("[tunnel] 启动失败：%v（面板「配置 → 远程访问」可看详情）", err)
+	}
+	defer tm.Stop()
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
@@ -330,12 +410,62 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// Trae 双池统一入口：/v1/models 一并列出 trae: 模型；trae: 前缀的对话
+		// 请求转交 Trae 池处理。客户端一个 base_url + key 就能用两个池的模型。
+		TraeModels: func() []map[string]any {
+			entries, _ := traeModelsForPanel(traeRT)
+			return entries
+		},
+		TraeChat: func(w http.ResponseWriter, r *http.Request) bool {
+			if traeRT == nil || traeRT.api == nil {
+				return false
+			}
+			traeRT.api.ServeHTTP(w, r)
+			return true
+		},
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+
+	// ---- Trae（TRAE SOLO）侧：单进程双池 -----------------------------------
+	// Trae 自带 auth 目录 / state / upstream / 调度器 / handler，通过 /trae/ 前缀
+	// 与 WorkBuddy 的 /v1/* 并列暴露，两侧完全独立、互不影响。
+	traeRT, err = setupTrae(cfg, tlsCfg, dnsDialer)
+	if err != nil {
+		log.Fatalf("setup trae: %v", err)
+	}
+	if traeRT != nil {
+		go traeRT.scheduler.Run(ctx)
+		// Trae 网页登录回调（默认 127.0.0.1:18080）：与主服务独立端口，只处理
+		// /authorize。端口被占不致命——降级为「手动粘贴回调链接」。
+		if cb := traeRT.callback; cb != nil {
+			go func() {
+				<-ctx.Done()
+				sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				_ = cb.Shutdown(sctx)
+			}()
+			go func() {
+				log.Printf("[trae] callback server on %s（Trae 登录 /authorize）", cb.Addr)
+				if err := cb.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					log.Printf("[trae] callback server (%s) failed: %v — 网页登录降级为手动粘贴回调链接", cb.Addr, err)
+				}
+			}()
+		}
+	}
+	// 路由分层：/trae/ 交给 Trae 侧，其余仍走 WorkBuddy 的 handler。
+	// 无论 Trae 是否启用都建这一层——面板的「Trae 账号」入口恒在（导航不随开关
+	// 变化），未启用时给一个可操作的说明页，比 404 有用得多。
+	// 注意 h 本身也是 ServeMux，外层不引入新的路径 clean 语义（内外两次 clean
+	// 结果相同），既有客户端行为不变。
+	root := http.NewServeMux()
+	if traeRT != nil {
+		root.Handle("/trae/", traeRT.handler)
+	} else {
+		root.Handle("/trae/", http.HandlerFunc(traeDisabledPage))
+	}
+	root.Handle("/", h)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -347,7 +477,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           root,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
 		// 请求体已无网关侧上限（max_body_mb 移除）。缺省 300s（issue #100：旧固定
@@ -373,6 +503,211 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// traeRuntime Trae 侧运行期句柄（main 负责启停）。
+type traeRuntime struct {
+	// handler 已完成 StripPrefix("/trae")，直接挂主 mux 的 "/trae/"。
+	handler   http.Handler
+	scheduler *traescheduler.Scheduler // 每日签到 + token 预刷新
+	callback  *http.Server             // 网页登录回调监听；nil = 不起（手动粘贴模式）
+	// pool / upstream 留给面板用：把 Trae 的模型并进「模型与档位」视图。
+	// 只读查询（挑一个可用账号拉列表），不消耗积分、不改池状态。
+	pool     *traepool.Pool
+	upstream *traeupstream.Client
+	// api 是未包 StripPrefix 的 handler 本体：主端点转发 trae: 请求时直接
+	// ServeHTTP 它（其内部 mux 认 /v1/chat/completions）。若传外层包装的
+	// handler，StripPrefix 匹配不上 /trae 前缀会 404。
+	api http.Handler
+}
+
+// traeModelsForPanel 把 Trae 侧模型转成面板「模型与档位」的条目格式。
+//
+// id 加 "trae:" 前缀 —— 与 cn: / global: 并列，前端按前缀分域筛选，渲染侧
+// 一行都不用改。只读查询：Pick 一个可用账号拉列表，不消耗积分。
+// 没有可用账号时返回空集而非错误：那只是「还没导入账号」，不该让整个模型页报错。
+func traeModelsForPanel(rt *traeRuntime) ([]map[string]any, error) {
+	if rt == nil || rt.pool == nil || rt.upstream == nil {
+		return nil, nil
+	}
+	acct := rt.pool.Pick()
+	if acct == nil {
+		return nil, nil
+	}
+	infos, err := rt.upstream.FetchModels(acct)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(infos))
+	for _, mi := range infos {
+		entry := map[string]any{
+			"id":   "trae:" + mi.ID,
+			"name": mi.Name,
+			// 思考能力：上游明确声明 enable 与否；未声明的（自定义占位模型）用
+			// reasoning_known=false 让前端显示「—」，而不是误判成「不支持思考」。
+			"reasoning_known":    mi.Reasoning != nil,
+			"supports_reasoning": mi.Reasoning != nil && *mi.Reasoning,
+			"supports_images":    mi.Multimodal,
+			// Thinking.Type 有 disabled 态 → 思考可关；不设的话前端会给
+			// 这些模型误打「思考常开」徽标。
+			"can_disable_thinking": mi.Reasoning != nil,
+			"is_default":         mi.IsDefault,
+			"description":        "Trae 侧模型：思考为开关式（上游无 low/medium/high 分档）。",
+		}
+		if mi.ContextWindow > 0 {
+			entry["context_length"] = mi.ContextWindow
+		}
+		if mi.MaxTokens > 0 {
+			entry["max_output_tokens"] = mi.MaxTokens
+		}
+		if mi.ToolCall != nil {
+			entry["supports_tool_call"] = *mi.ToolCall
+		}
+		if mi.Rate > 0 {
+			entry["credits"] = mi.Rate // 积分消耗倍率，与 WB 的倍率列同一展示位
+		}
+		// 声明思考档位：模型配置接口只给开/关，但上游请求体认 low/medium/high
+		//（实测 InvalidParameter 错误信息证实），服务端默认 high。声明出来，
+		// 客户端（Chatbox 等）才会渲染档位选择器；WB 侧同名字段同一口径。
+		if mi.Reasoning != nil && *mi.Reasoning {
+			// 值域来自 IDE 客户端 i18n（xhigh/high/low，无 medium 无关闭档）。
+			entry["supported_efforts"] = []string{"low", "high", "xhigh"}
+			entry["default_effort"] = "high"
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+// setupTrae 装配 Trae（TRAE SOLO）侧的第二套实例（单进程双池）。
+//
+// 为什么是「独立成套」而不是与 WorkBuddy 共用一个账号池：两侧的凭证模型
+// （Trae 是 machineId/deviceId，WorkBuddy 是 realm + device_token）、上游协议
+// （trae.cn 的 v1/v2 接口 vs copilot.tencent.com）与风控形态（Trae 的 x-device-id
+// 是硬校验，且一个设备号一天只能签一个账号）都不同，共用池等于把两套状态机揉在
+// 一起。这里让它们各自完整，只在同一个二进制、同一份配置、同一个 Web 面板里共存。
+//
+// 路由形态取 /trae/* 独立端点（而非把模型混进 /v1/models 加前缀）：两侧的配额、
+// 冷却、日志口径完全不同，混成一个模型列表会让「这个模型该走谁的池」变成隐式
+// 约定；独立端点则完全平行，客户端各自配 base_url，互不干扰。
+//
+// cfg.Trae.Enabled 为 false 时返回 (nil, nil)：不加载账号、不注册路由、不起调度器，
+// 对既有部署零影响。
+func setupTrae(cfg *Config, tlsCfg *tls.Config, dnsDialer *net.Dialer) (*traeRuntime, error) {
+	if !cfg.Trae.Enabled {
+		return nil, nil
+	}
+	tAuths, err := traeauth.LoadDir(cfg.Trae.AuthDir)
+	if err != nil {
+		return nil, fmt.Errorf("load trae auths (%s): %w", cfg.Trae.AuthDir, err)
+	}
+	log.Printf("[trae] loaded %d account(s) from %s", len(tAuths), cfg.Trae.AuthDir)
+
+	tp := traepool.New(cfg.Trae.StateFile)
+	// 与 auths 目录对齐：新账号加入、已删文件账号剔除（状态保留）。
+	tp.SyncToDir(tAuths)
+
+	tup := traeupstream.New()
+	tup.HTTP.Timeout = time.Duration(cfg.Trae.Upstream.TimeoutSeconds) * time.Second
+	// HTTP 与 StreamHTTP 共享同一个 Transport（见 traeupstream.New），改一次即可。
+	if tr, ok := tup.HTTP.Transport.(*http.Transport); ok {
+		// 流式侧无总超时，仅用首字节兜底（整流时长由 SSE 本身决定）。
+		tr.ResponseHeaderTimeout = time.Duration(cfg.Trae.Upstream.TimeoutSeconds) * time.Second
+		// 出站 TLS / DNS 复用主进程装配：「中间人代理自签 CA」与「Android 没有
+		// /etc/resolv.conf」两个场景对 Trae 侧同样成立，不配就会全线失败——且
+		// 症状与 WorkBuddy 侧一模一样，没必要让用户配两遍。
+		if tlsCfg != nil {
+			tr.TLSClientConfig = tlsCfg
+		}
+		if dnsDialer != nil {
+			tr.DialContext = dnsDialer.DialContext
+		}
+	}
+
+	tsch := traescheduler.New(traescheduler.Config{
+		Pool:            tp,
+		Upstream:        tup,
+		CheckinHours:    cfg.Trae.Schedule.CheckinHours,
+		RefreshHours:    cfg.Trae.Schedule.RefreshHours,
+		RefreshSkew:     cfg.TraeRefreshSkewDur,
+		CheckinDisabled: !cfg.Trae.Schedule.CheckinEnabled,
+		RefreshDisabled: !cfg.Trae.Schedule.RefreshEnabled,
+	})
+	if !cfg.Trae.Schedule.CheckinEnabled {
+		log.Printf("[trae] 签到已禁用（trae.schedule.checkin_enabled=false）")
+	} else {
+		log.Printf("[trae] 签到已启用：%v 点", cfg.Trae.Schedule.CheckinHours)
+	}
+	if !cfg.Trae.Schedule.RefreshEnabled {
+		log.Printf("[trae] token 保活已禁用（trae.schedule.refresh_enabled=false）")
+	} else {
+		log.Printf("[trae] token 保活已启用：%v 点", cfg.Trae.Schedule.RefreshHours)
+	}
+
+	th := traeserver.NewHandler(traeserver.Config{
+		Pool:         tp,
+		Upstream:     tup,
+		APIKey:       cfg.APIKey, // 与主服务同一把 key：面板与客户端共用一套凭证
+		AuthDir:      cfg.Trae.AuthDir,
+		PlanCooldown: cfg.TraePlanCreditDur,
+		SoftCooldown: cfg.TraeSoftRateDur,
+		ErrThreshold: cfg.Trae.Cooldown.ErrThreshold,
+		ErrCooldown:  cfg.TraeErrCooldownDur,
+		RefreshSkew:  cfg.TraeRefreshSkewDur,
+		DefaultModel: cfg.Trae.DefaultModel,
+	})
+
+	rt := &traeRuntime{
+		handler:   http.StripPrefix("/trae", th),
+		pool:      tp,
+		upstream:  tup,
+		api:       th,
+		scheduler: tsch,
+	}
+	if cp := cfg.Trae.CallbackPort; cp != "" && cp != "0" {
+		rt.callback = &http.Server{
+			Addr:              "127.0.0.1:" + cp,
+			Handler:           th, // /authorize 注册在 Trae handler 的 mux 上
+			ReadHeaderTimeout: 30 * time.Second,
+		}
+	}
+	return rt, nil
+}
+
+// traeDisabledPage Trae 侧未启用时 /trae/* 的说明页。
+//
+// 面板导航里的「Trae 账号」入口是固定的（不做前后端开关联动——少一处状态同步，
+// 也就少一处不一致），所以点进来必须看到「怎么打开它」，而不是一个裸 404。
+// 样式不写死颜色：跟随浏览器默认前景/背景，深浅主题都不会读不清。
+func traeDisabledPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.WriteString(w, `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trae 侧未启用</title>
+<style>
+body{font:14px/1.75 -apple-system,system-ui,"Segoe UI",sans-serif;margin:0;padding:32px;max-width:720px}
+h1{font-size:16px;font-weight:500;margin:0 0 14px}
+code{background:rgba(127,127,127,.14);padding:2px 6px;border-radius:4px;font-family:ui-monospace,Consolas,monospace}
+pre{background:rgba(127,127,127,.1);padding:14px;border-radius:8px;overflow:auto;font-family:ui-monospace,Consolas,monospace}
+</style>
+</head>
+<body>
+<h1>Trae 侧未启用</h1>
+<p>本次部署没有打开 TRAE SOLO 侧。在 <code>config.json</code> 里加上下面这段并重启，再回到本页即可看到 Trae 账号池：</p>
+<pre>"trae": {
+  "enabled": true
+}</pre>
+<p>也可以不改文件，用环境变量 <code>WB2A_TRAE_ENABLED=1</code> 启动。</p>
+<p>把 Trae 账号的凭证 JSON（文件名形如 <code>trae-*.json</code>）放进 <code>auths/</code> 目录即可被自动识别——
+它与 WorkBuddy 的 <code>workbuddy*.json</code> 文件名前缀不重叠，同一个目录里互不干扰。</p>
+<p>Trae 侧的接口挂在本站 <code>/trae/</code> 前缀下：<code>/trae/v1/chat/completions</code>、<code>/trae/v1/models</code>、
+<code>/trae/status</code>，与 WorkBuddy 的 <code>/v1/*</code> 完全平行，客户端各自配一个 base_url 即可。</p>
+</body>
+</html>`)
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
@@ -426,6 +761,20 @@ func panelListenPath(listen string) string {
 	return listen
 }
 
+// tunnelConfigFrom 把配置段转成隧道包自己的参数类型。
+//
+// 两侧字段一一对应但类型不同（配置侧是匿名 struct），显式转一次，省得让
+// internal/tunnel 反向依赖 cmd/server 的配置类型。
+func tunnelConfigFrom(c *Config) tunnel.Config {
+	return tunnel.Config{
+		Enabled: c.Tunnel.Enabled,
+		Mode:    c.Tunnel.Mode,
+		Token:   c.Tunnel.Token,
+		Binary:  c.Tunnel.Binary,
+		Target:  c.Tunnel.Target,
+	}
+}
+
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
@@ -439,7 +788,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, tm *tunnel.Manager) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -525,6 +874,16 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+
+	// 隧道开关在这里热生效，不必重启网关。放在最后：上面任何一步失败都已 return，
+	// 不会出现「配置没落盘、隧道却被拉起来」。
+	if tm != nil {
+		if err := tm.Apply(tunnelConfigFrom(newCfg)); err != nil {
+			// 不往上抛：配置本身确实已经保存成功了，启动失败属于运行时问题，
+			// 面板从 /panel/api/tunnel 的 Err 读即可，别让「保存」这个动作假报失败。
+			log.Printf("[tunnel] 应用新配置失败：%v", err)
+		}
+	}
 
 	return restartRequiredFields(newCfg), nil
 }

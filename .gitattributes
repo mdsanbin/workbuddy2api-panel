@@ -1,0 +1,10 @@
+# KernelSU / Magisk 模块里的脚本必须是 LF。
+# Android 用的是 mksh，脚本带 CRLF 会报 "not found" 一类错误；而本机
+# core.autocrlf=true，不加这条约束，这些文件检出时就可能被转成 CRLF。
+kernelsu-module/*.sh                text eol=lf
+kernelsu-module/*.md                text eol=lf
+kernelsu-module/*.prop              text eol=lf
+kernelsu-module/build.py            text eol=lf
+kernelsu-module/config/config.json  text eol=lf
+kernelsu-module/bin/version.txt     text eol=lf
+kernelsu-module/bin/wb2api          binary

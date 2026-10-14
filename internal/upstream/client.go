@@ -681,6 +681,11 @@ type Client struct {
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// alpn 出站 ALPN 策略（config tls_alpn，缺省 ALPNHTTP1）。由 SetALPNMode 在
+	// 启动期写入一次、之后只读；SetTLSConfig 读取它来保证 TLS 侧与 transport 侧
+	// 的 ALPN 认知始终同调（见 alpn.go）。零值按 ALPNHTTP1 处理。
+	alpn ALPNMode
 }
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：真正禁 h2 /
@@ -697,6 +702,9 @@ func New() *Client {
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
+		// 出站 ALPN 缺省只广告 http/1.1：与 newTransport 的「禁 h2」同调，
+		// 且显式写法不会因隐式行为变化而分叉（见 alpn.go）。
+		alpn: ALPNHTTP1,
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c

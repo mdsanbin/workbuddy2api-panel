@@ -27,6 +27,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/tunnel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -65,6 +66,30 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// Shutdown 触发网关优雅停机（由 main 注入：内部取消 signal.NotifyContext 的 ctx，
+	// 与 Ctrl+C / SIGTERM 走完全相同的路径）。nil = 该部署不支持从面板停止服务。
+	Shutdown func()
+
+	// ShutdownMark 停机前写入「停止请求」标记的文件路径（空 = 不写）。
+	//
+	// 为什么需要它：KernelSU 模块里网关是 watcher.sh 的子进程，watcher 见子进程
+	// 退出就会把它拉起来——只让进程退出等于「重启」，用户点「停止服务」会看着
+	// 服务又回来。退出前写这个标记，watcher 醒来见标记即自行退出、不再拉起。
+	// 直接跑二进制的场景没有守护进程，留空即可。
+	ShutdownMark string
+
+	// Tunnel 公网隧道（Cloudflare Tunnel）管理器，由 main 注入。
+	// nil = 该部署不支持隧道（/panel/api/tunnel 返回 501）。
+	//
+	// 这里只做状态展示：「是否启用」本身是配置项，开关走 SaveConfig →
+	// main 侧调 Apply 热生效，避免出现配置与进程状态对不上的窗口。
+	Tunnel *tunnel.Manager
+
+	// TraeModels 查 Trae 侧模型列表（nil = 该部署未启用 Trae）。
+	// 返回的条目直接进 /panel/api/models 的结果集，id 形如 trae:<name>——
+	// 与 cn: / global: 并列，前端「模型与档位」按前缀筛选，渲染侧无需改动。
+	TraeModels func() ([]map[string]any, error)
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -188,6 +213,16 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// 停止服务（shutdown.go）：优雅停机 + 给模块守护写停驻标记。
+	p.mux.HandleFunc("POST /panel/api/shutdown", p.withAuth(p.shutdown))
+	// 公网隧道状态（tunnel.go）：只读；开关走 /panel/api/config 保存。
+	p.mux.HandleFunc("GET /panel/api/tunnel", p.withAuth(p.tunnelStatus))
+
+	// TLS 诊断页（tlsdiag.go）：探测上游真实证书链、一键信任中间人 CA。
+	p.mux.HandleFunc("GET /panel/tls", p.tlsPage)
+	p.mux.HandleFunc("GET /panel/tls.js", p.tlsScript)
+	p.mux.HandleFunc("GET /panel/api/tls/probe", p.withAuth(p.tlsProbe))
+	p.mux.HandleFunc("POST /panel/api/tls/trust", p.withAuth(p.tlsTrust))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -352,6 +387,17 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+		}
+	}
+
+	// Trae 侧（第三条产品线）：与 cn / global 并列展示，id 前缀 trae:。
+	// 与上面两域同样的取舍 —— 查不到只记错误串，不让整个列表 500。
+	if p.cfg.TraeModels != nil {
+		entries, err := p.cfg.TraeModels()
+		if err != nil {
+			fetchErrs = append(fetchErrs, "trae: "+err.Error())
+		} else {
+			out = append(out, entries...)
 		}
 	}
 

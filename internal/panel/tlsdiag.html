@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TLS 证书诊断 · WorkBuddy2API</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --fg:#1c1f23; --dim:#5f6874; --line:#dfe3e8;
+    --card:#ffffff; --acc:#2f6fed; --ok:#12805c; --bad:#c0392b; --warn:#9a6a00;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#15181c; --fg:#e7ebf0; --dim:#98a2b0; --line:#2a2f36;
+      --card:#1c2026; --acc:#6ea0ff; --ok:#3ddc97; --bad:#ff7a6b; --warn:#e2b04a;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:18px;background:var(--bg);color:var(--fg);
+       font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:860px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 6px}
+  p.lead{margin:0 0 16px;color:var(--dim);font-size:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:0 0 14px}
+  label{display:block;font-size:13px;color:var(--dim);margin:0 0 6px}
+  input{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;
+        background:var(--bg);color:var(--fg);font-size:14px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .row>div{flex:1 1 260px;min-width:0}
+  button{padding:9px 16px;border:1px solid var(--line);border-radius:8px;background:var(--card);
+         color:var(--fg);font-size:14px;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+  button:disabled{opacity:.5;cursor:default}
+  .muted{color:var(--dim);font-size:13px}
+  .mono{font-family:var(--mono);font-size:12.5px;word-break:break-all}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  .cert{border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0;background:var(--bg)}
+  .cert h3{margin:0 0 6px;font-size:14px}
+  .kv{display:grid;grid-template-columns:88px 1fr;gap:2px 10px;font-size:13px}
+  .kv div:first-child{color:var(--dim)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+       border:1px solid var(--line);margin-left:6px;vertical-align:1px}
+  .tag.ca{color:var(--acc);border-color:var(--acc)}
+  .tag.self{color:var(--warn);border-color:var(--warn)}
+  #status{margin:10px 0 0;font-size:13.5px}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--dim);font-size:13px}
+  .hint{background:color-mix(in srgb,var(--warn) 12%,transparent);
+        border-left:3px solid var(--warn);padding:8px 12px;border-radius:6px;
+        font-size:13px;margin:10px 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TLS 证书诊断</h1>
+  <p class="lead">
+    用于排查 <span class="mono">x509: certificate signed by unknown authority</span>。
+    若上游 TLS 由代理（VPN / 抓包 / 企业网关）中间人签发，本页可探测其真实证书链并一键信任。
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="host">上游主机（可带端口）</label>
+        <input id="host" type="text" spellcheck="false" placeholder="copilot.tencent.com">
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="btnProbe" class="primary" type="button">探测证书</button>
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="btnTrust" type="button" disabled>信任并保存</button>
+      </div>
+    </div>
+    <div id="status" class="muted">尚未探测。</div>
+    <details>
+      <summary>面板 API Key（本机不鉴权时可留空）</summary>
+      <div style="margin-top:8px">
+        <input id="key" type="password" spellcheck="false" placeholder="与面板 / v1 接口同一个 api_key">
+      </div>
+    </details>
+  </div>
+
+  <div id="verdict"></div>
+  <div id="chain"></div>
+
+  <div class="card">
+    <p class="muted" style="margin:0">
+      保存位置会写在下方结果里（默认是与 <span class="mono">config.json</span> 同目录的
+      <span class="mono">ca.pem</span>）。该文件会被服务启动时自动并入信任池；也可在配置里用
+      <span class="mono">tls_ca_file</span> 显式指定其它路径。
+    </p>
+  </div>
+</div>
+<script src="/panel/tls.js"></script>
+</body>
+</html>

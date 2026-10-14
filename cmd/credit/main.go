@@ -16,8 +16,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -143,7 +145,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	if af.Auth.Domain != "" {
 		req.Header.Set("X-Domain", af.Auth.Domain)
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := creditHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, 0, 0, 0, err
@@ -189,6 +191,42 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		}
 	}
 	return remain, used, size, packs, nil
+}
+
+// creditHTTPClient 出站 client，与网关（internal/upstream/alpn.go）同口径：
+// TLS 层「广告什么协议」必须与 HTTP 层「认识什么协议」一致。
+//
+// 原来这里是裸 `&http.Client{Timeout: 20s}`（Transport 为 nil → 标准库
+// DefaultTransport），它自己会注册并广告 h2 —— 多数域名没事，但国际版
+// www.workbuddy.ai 严格按 ALPN 办事：一旦协商出 h2 就回 HTTP/2 帧，而任何把 h2
+// 关掉的 transport 都会把它读成
+//
+//	net/http: HTTP/1.x transport connection broken: malformed HTTP response
+//	"\x00\x00\x12\x04..."（h2 的 SETTINGS 帧头）
+//
+// 这里显式锁定 http/1.1 并同步禁 h2，保持与网关一致。
+// 不 import internal/upstream：本 CLI 刻意保持零第三方依赖，几行等价配置更划算。
+// 环境强制 h2 时用 WB2A_TLS_ALPN=h2 切换（与网关同名开关）。
+func creditHTTPClient() *http.Client {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("WB2A_TLS_ALPN")), "h2") {
+		tr.TLSClientConfig = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+		tr.TLSNextProto = nil // 交还标准库自动注册 h2
+		tr.ForceAttemptHTTP2 = true
+	} else {
+		tr.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+		// 空（非 nil）映射：标准库不再注册 h2，与上面的 ALPN 公告同调。
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return &http.Client{Timeout: 20 * time.Second, Transport: tr}
 }
 
 func main() {

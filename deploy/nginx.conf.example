@@ -1,0 +1,81 @@
+# WorkBuddy2API 反向代理示例（Nginx）
+#
+# ── 硬约束（决定了这份配置长什么样）──────────────────────────────────
+# 1. 网关所有路由都是**绝对路径**（/v1/*、/panel/*、/trae/*），没有 base_path
+#    配置项。所以只能把它挂在某个 origin 的根上，**不能挂到 /wb2api/ 这类子路径**
+#    —— 前端代码里的 fetch('/panel/api/...') 会打到站点根，全部 404。
+# 2. 面板的「Trae 账号」页用**同源 iframe** 内嵌 /trae/admin
+#    （面板 CSP 的 frame-src 'self' + Trae 页的 frame-ancestors 'self'）。
+#    所以 /panel/ 与 /trae/ 必须在同一个 scheme+host+port 下 ——
+#    **独立子域名可以，换端口不行**（换端口就是换 origin，iframe 会被拦成空白）。
+#
+# ── 用法 ────────────────────────────────────────────────────────────
+#   cp deploy/nginx.conf.example /etc/nginx/conf.d/wb2api.conf
+#   改 server_name / 证书路径；网关仍监听 127.0.0.1:7863 则 upstream 不用动
+#   nginx -t && nginx -s reload
+
+upstream wb2api_backend {
+    server 127.0.0.1:7863;
+    keepalive 32;
+}
+
+# 明文 HTTP 一律跳到 HTTPS（网关自身不提供 TLS）
+server {
+    listen 80;
+    listen [::]:80;
+    server_name wb2api.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # nginx < 1.25.1 请改成：listen 443 ssl http2;
+    http2 on;
+    server_name wb2api.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/wb2api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/wb2api.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+
+    # 网关侧不限制请求体（大上下文 / 文件块），别让 Nginx 先拦下来
+    client_max_body_size 64m;
+    client_body_timeout  300s;
+
+    # 探活：无鉴权，适合给外部监控 / 编排用
+    location = /healthz {
+        proxy_pass http://wb2api_backend;
+        proxy_set_header Host $host;
+        access_log off;
+    }
+
+    location / {
+        proxy_pass http://wb2api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        # 网关靠 XFF 首段 / X-Real-IP 记「调用来源」，不设的话日志里全是 127.0.0.1
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        # ── SSE 流式（/v1/chat/completions 的 stream:true）──────────────
+        # 网关已经在响应上写了 X-Accel-Buffering: no，Nginx 会据此自动关缓冲；
+        # 这里再显式关一层，避免将来有人加了 proxy_ignore_headers 把它吃掉。
+        proxy_buffering         off;
+        proxy_cache             off;
+        proxy_request_buffering off;
+
+        # SSE 两次 token 之间可能长时间静默（模型思考中），超时必须放宽，
+        # 否则会出现「聊到一半连接被反代掐断」。网关自己的 read_timeout 默认 300s，
+        # 若调大了它，这里也要同步跟上。
+        proxy_read_timeout    3600s;
+        proxy_send_timeout    3600s;
+        proxy_connect_timeout 30s;
+    }
+
+    # 注意：不要在这里加 X-Frame-Options / CSP。
+    # 面板与 Trae 管理页各自已经发了正确的头（frame-src 'self' / frame-ancestors 'self'），
+    # 在反代层再叠一层 DENY 会把面板内嵌 Trae 页的功能直接打死（页面一片空白）。
+}

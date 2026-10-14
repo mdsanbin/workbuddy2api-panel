@@ -44,6 +44,9 @@
   .nav.open { transform: translateX(0); }
   .nav ul { display: block; padding: 10px 8px; }
   .nav .sig { border-top: 1px solid var(--line-soft); }
+  /* Trae 页的 iframe：手机上顶栏比桌面矮，桌面那条 calc(100vh - 200px) 会留出
+     大半屏空白；按手机端实际占用重算，并放低 min-height 让横屏也不溢出。 */
+  .trae-frame { height: calc(100vh - 150px); min-height: 320px; }
   .nav-btn { display: inline-flex; align-items: center; padding: 6px 8px; }
   .nav-veil {
     display: block; position: fixed; inset: 0; z-index: 65;

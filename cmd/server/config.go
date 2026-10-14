@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,9 +22,60 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// ShutdownMarker 面板「停止服务」时写入的标记文件路径（空 = 不写）。
+	//
+	// KernelSU 模块部署把它指到 $DATA_DIR/stop_request：模块的 watcher.sh 会在网关
+	// 退出后发现该标记并自行退出，不再把网关拉起来。留空 = 只停进程（直接跑二进制的
+	// 场景没有守护进程，本来就不需要这个信号）。
+	ShutdownMarker string `json:"shutdown_marker,omitempty"`
 	// DNSServers 出站解析用的 DNS 服务器（空 = 系统解析器）；也可用 WB2A_DNS 覆盖。
 	// Android/magisk 模块里没有 /etc/resolv.conf，必须显式指定，否则解析全落本机 :53。
 	DNSServers []string `json:"dns_servers,omitempty"`
+	// TLSCAFile 出站 HTTPS 额外信任的 CA（PEM 文件路径，可含多张证书）；也可用 WB2A_CA_FILE 覆盖。
+	//
+	// 用于中间人代理场景：代理 CA 装在「用户级」证书库（Android 用户证书
+	// /data/misc/user/0/cacerts-added、浏览器私有库等）时，Go 的默认根池
+	// （Android/Linux 的 /system/etc/security/cacerts、Windows 系统证书库）取不到它，
+	// 于是所有上游请求一律报
+	//   tls: failed to verify certificate: x509: certificate signed by unknown authority
+	// 填代理 CA 的 PEM 即可（与系统根求并集，不降低直连域名的安全性）。
+	// 留空 = 完全保持默认行为（仅系统根池）。
+	TLSCAFile string `json:"tls_ca_file,omitempty"`
+	// TLSInsecureSkipVerify 跳过出站 HTTPS 证书校验（默认 false）；也可用 WB2A_TLS_INSECURE=1 覆盖。
+	// 最后手段：等于对上游放弃中间人防护，仅在拿不到代理 CA 时临时使用。
+	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
+
+	// TLSAutoTrust 出站 TLS 自动修（默认 true）：启动后在后台探测上游证书链，若系统
+	// 根池不信任（= 中间人代理自签 CA），就把对端实际出示的链写入 ca.pem 并热加载
+	// 生效——无需人工导出或指定 CA；请求撞上证书错误时也会现场再修一次并重试。
+	//
+	// 安全说明：这是 TOFU（首次使用即信任）——信任「第一次握手见到的证书」，若此刻
+	// 恰好存在攻击者，等于把凭证交给对方。故内置清单只含本服务本来就要访问的腾讯
+	// 域名（见 autoTrustHosts），且可用 tls_auto_trust=false 整体关闭。
+	// 注意：不加 omitempty —— 默认 true，用户显式设 false 时必须能被序列化出来。
+	TLSAutoTrust bool `json:"tls_auto_trust"`
+	// TLSAutoTrustHosts 自动修探测的目标主机清单；空 = 内置默认（CN 上游 + global 上游）。
+	// 显式配置即完全替换内置清单（不合并），避免误信任无关主机。
+	// 也可用 WB2A_TLS_AUTO_TRUST_HOSTS=a.com,b.com 覆盖。
+	TLSAutoTrustHosts []string `json:"tls_auto_trust_hosts,omitempty"`
+	// TLSAutoTrustRetryMinutes 首轮未修好时的后台重试间隔（分钟）；<=0 = 只试一次。
+	// 设备上「代理尚未就绪」（VPN 刚连上、网关刚下发策略）很常见，故默认 5 分钟一轮。
+	// 也可用 WB2A_TLS_AUTO_TRUST_RETRY_MINUTES 覆盖。
+	TLSAutoTrustRetryMinutes int `json:"tls_auto_trust_retry_minutes"`
+
+	// TLSALPN 出站 ALPN 档位（TLS 层向对端「广告」的应用协议，必须与 transport 层
+	// 「认识哪些协议」同调，否则会得到 malformed HTTP response——对端回 HTTP/2 帧、
+	// 本客户端按 HTTP/1.x 解析；成因与实证见 internal/upstream/alpn.go）。
+	//
+	//	"http/1.1"（默认）只广告 http/1.1，与出站禁 h2 的既有策略同调；
+	//	"h2"             广告 h2+http/1.1 并真正启用 h2。
+	//
+	// 什么时候需要改成 "h2"：中间盒 / VPN / 企业网关无视 ALPN 径自按 h2 回帧时，
+	// 客户端说什么都没用，唯有真的讲 h2 才通。典型症状是国际版（workbuddy.ai）
+	// 查询报 `malformed HTTP response "\x00\x00\x12\x04..."`，而国内域名正常
+	// （国内网关宽容，无视 ALPN 也回 HTTP/1.1）。
+	// 也可用 WB2A_TLS_ALPN 覆盖。
+	TLSALPN string `json:"tls_alpn,omitempty"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -216,6 +268,103 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// Trae TRAE SOLO（TraeWork）侧配置：与 WorkBuddy 完全平行的第二套账号池。
+	//
+	// 形态是「单进程双池」而不是「统一池」：两侧的凭证模型 / 上游协议 / 风控字段
+	// 都不同（Trae 侧是 x-machine-id + x-device-id 硬校验，WorkBuddy 侧是
+	// X-Device-Token），共用一个池等于把两套状态机揉在一起。这里让它们各自持有
+	// 独立的 auth 目录 / state 文件 / upstream client / 调度器，只在同一个二进制、
+	// 同一个 Web 面板和同一份配置里共存，接口面走 /trae/* 前缀与本体的 /v1/* 并列。
+	Trae struct {
+		// Enabled 是否装配 Trae 侧（缺省 true）。
+		// 关闭时不加载任何 Trae 账号、不注册 /trae/* 路由、不起 Trae 调度器。
+		//
+		// 为什么默认开：Trae 侧只在 auths/ 里存在 trae-*.json 时才有账号可加载，
+		// 没有凭证时它只是一个空池 + 一条 /trae/ 路由，成本可忽略；而默认关闭会让
+		// 用户导入凭证后还得再翻配置打开开关，多一道无谓的坎。要关显式写 false。
+		Enabled bool `json:"enabled"`
+
+		// AuthDir Trae 凭证目录（扫 trae-*.json）。空 = 复用主 auth_dir。
+		//
+		// 复用是安全的：两侧的 glob 模式不重叠（workbuddy*.json vs trae-*.json），
+		// 同一目录天然互不污染。默认取空值即是为了让用户把 trae-*.json 直接丢进
+		// 现有 auths/ 就能被识别，不必再记一个新目录。需要严格隔离时显式配本键。
+		AuthDir string `json:"auth_dir"`
+
+		// StateFile Trae 池状态文件。空 = 与主 state_file 同目录的 state-trae.json。
+		//
+		// 必须与 WorkBuddy 的 state.json 分开：两侧的持久化结构不同（Trae 池没有
+		// 熔断 / 连败降权 / 模型级冷却 / 成本台账这些字段），共用文件会让两边互相
+		// 把对方的键洗掉。
+		StateFile string `json:"state_file"`
+
+		// DefaultModel 客户端未指定 model 时的缺省模型。空 = 回落内置 glm-5.2。
+		DefaultModel string `json:"default_model"`
+
+		// CallbackPort Trae 网页登录的回调监听端口（监听 127.0.0.1）；"0" = 不起，
+		// 降级为「手动粘贴回调链接」。与主服务的端口独立，避免与其它登录流程抢占。
+		CallbackPort string `json:"callback_port"`
+
+		Schedule struct {
+			CheckinHours []int `json:"checkin_hours"` // [9]，空 = 回落默认
+			RefreshHours []int `json:"refresh_hours"` // [3]，空 = 回落默认
+			// CheckinEnabled/RefreshEnabled 显式禁用开关（缺省 true）。
+			// 语义同主 schedule：bool 缺省 true 保证老配置零影响，只有显式 false 才关。
+			CheckinEnabled bool `json:"checkin_enabled"`
+			RefreshEnabled bool `json:"refresh_enabled"`
+		} `json:"schedule"`
+
+		// Cooldown 冷却参数。Trae 侧的冷却语义比 WorkBuddy 简单，只有三类：
+		// 1005 plan 权益不足（长冷却）、429（短冷却）、连续错误（中冷却）。
+		Cooldown struct {
+			PlanCredit   string `json:"plan_credit"`   // "12h"
+			SoftRate     string `json:"soft_rate"`     // "60s"
+			ErrThreshold int    `json:"err_threshold"` // 3
+			ErrCooldown  string `json:"err_cooldown"`  // "10m"
+		} `json:"cooldown"`
+
+		Upstream struct {
+			TimeoutSeconds int `json:"timeout_seconds"` // 120
+		} `json:"upstream"`
+
+		// RefreshSkew token 预刷新窗口（缺省 24h）：Trae 的 access token 有效期短，
+		// 提前量给足，避免请求打到过期 token 上。空/非法回落默认。
+		RefreshSkew string `json:"refresh_skew"`
+	} `json:"trae"`
+
+	// Tunnel 按需开启的公网隧道（Cloudflare Tunnel）。
+	//
+	// 设计取向是「默认关、用时开」：它**不改本机任何网络配置**（纯出站——cloudflared
+	// 主动连 Cloudflare 边缘，不监听入站端口、不动路由表 / DNS / 防火墙），但会把面板
+	// 暴露到公网，所以不该默认开着。装好 cloudflared 后在面板「配置 → 远程访问」里
+	// 打开开关即可，无需重启进程。
+	Tunnel struct {
+		// Enabled 是否启动隧道。缺省 false（按需开启）。
+		Enabled bool `json:"enabled"`
+
+		// Mode 隧道模式：
+		//   "quick"  临时公网地址（xxx.trycloudflare.com），无需 Cloudflare 账号，
+		//            每次启动地址都不同，适合临时用一次；
+		//   "token"  用 Zero Trust 里建好的 tunnel token，地址固定。
+		Mode string `json:"mode"`
+
+		// Token token 模式的凭据（cloudflared tunnel run --token）。
+		Token string `json:"token"`
+
+		// Binary cloudflared 可执行文件路径。空 = 走 PATH 查找。
+		Binary string `json:"binary"`
+
+		// Target 隧道指向的本地地址。空 = 自动取当前监听端口拼 127.0.0.1，
+		// 避免用户手填写错端口（回源走环回，不必也不该绕本机对外 IP）。
+		Target string `json:"target"`
+	} `json:"tunnel"`
+
+	// Trae 解析后的 duration
+	TraePlanCreditDur  time.Duration `json:"-"`
+	TraeSoftRateDur    time.Duration `json:"-"`
+	TraeErrCooldownDur time.Duration `json:"-"`
+	TraeRefreshSkewDur time.Duration `json:"-"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -271,6 +420,11 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// 出站 TLS 自动修：默认开启（作用域由 autoTrustHosts 白名单约束）。
+	c.TLSAutoTrust = true
+	c.TLSAutoTrustRetryMinutes = 5
+	// 出站 ALPN 缺省只广告 http/1.1（与 transport 禁 h2 同调）；h2 是逃生门。
+	c.TLSALPN = "http/1.1"
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
@@ -296,6 +450,31 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// Tunnel 缺省关闭（按需开启）：它会把面板暴露到公网，不该默认开着。
+	// Mode 缺省 quick —— 无需 Cloudflare 账号即可验证链路，先用起来再谈固定域名。
+	// Binary 空 = 走 PATH 查找 cloudflared；Target 空 = 自动指向本机监听端口。
+	c.Tunnel.Enabled = false
+	c.Tunnel.Mode = "quick"
+
+	// Trae 侧：Enabled 缺省 true（开箱即用；要关显式写 false）。之所以敢默认开：
+	// Trae 侧只在 auths/ 里存在 trae-*.json 时才有账号可加载，没有凭证时它只是
+	// 一个空池 + 一条 /trae/ 路由，成本可忽略；默认关闭反而会让用户导入凭证后
+	// 还得再去翻配置打开开关。其余键给出与 trae2api-web 一致的推荐值。
+	// AuthDir 缺省空 = 复用主 auth_dir；StateFile 缺省空 = 主 state 同目录的
+	// state-trae.json（两者都在 normalizeTrae 里补齐）。
+	c.Trae.Enabled = true
+	c.Trae.DefaultModel = "glm-5.2"
+	c.Trae.CallbackPort = "18080"
+	c.Trae.Schedule.CheckinHours = []int{9}
+	c.Trae.Schedule.RefreshHours = []int{3}
+	c.Trae.Schedule.CheckinEnabled = true
+	c.Trae.Schedule.RefreshEnabled = true
+	c.Trae.Cooldown.PlanCredit = "12h"
+	c.Trae.Cooldown.SoftRate = "60s"
+	c.Trae.Cooldown.ErrThreshold = 3
+	c.Trae.Cooldown.ErrCooldown = "10m"
+	c.Trae.Upstream.TimeoutSeconds = 120
+	c.Trae.RefreshSkew = "24h"
 	return c
 }
 
@@ -455,6 +634,66 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_DNS"); v != "" {
 		c.DNSServers = splitCSV(v)
 	}
+	if v := os.Getenv("WB2A_CA_FILE"); v != "" {
+		c.TLSCAFile = v
+	}
+	if v := os.Getenv("WB2A_TLS_INSECURE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.TLSInsecureSkipVerify = b
+		}
+	}
+	if v := os.Getenv("WB2A_TLS_AUTO_TRUST"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.TLSAutoTrust = b
+		}
+	}
+	if v := os.Getenv("WB2A_TLS_AUTO_TRUST_HOSTS"); v != "" {
+		c.TLSAutoTrustHosts = splitCSV(v)
+	}
+	if v := os.Getenv("WB2A_TLS_AUTO_TRUST_RETRY_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.TLSAutoTrustRetryMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_TLS_ALPN"); v != "" {
+		c.TLSALPN = v
+	}
+	// Trae 侧覆盖（KernelSU/Magisk 模块与容器部署惯用 env 注入，免改 config.json）。
+	// 只给最常按部署环境变化的三项；其余（排程/冷却）留在配置文件里。
+	if v := os.Getenv("WB2A_TRAE_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Trae.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_TRAE_AUTH_DIR"); v != "" {
+		c.Trae.AuthDir = v
+	}
+	if v := os.Getenv("WB2A_TRAE_STATE_FILE"); v != "" {
+		c.Trae.StateFile = v
+	}
+	if v := os.Getenv("WB2A_TRAE_DEFAULT_MODEL"); v != "" {
+		c.Trae.DefaultModel = v
+	}
+	// 停机标记：模块的 service.sh 在老版 config.json 缺少该键时用它兜底
+	// （见其注释）。显式配了 shutdown_marker 的部署不会被覆盖。
+	if v := os.Getenv("WB2A_SHUTDOWN_MARKER"); v != "" {
+		c.ShutdownMarker = v
+	}
+	// Tunnel 侧覆盖（同样面向模块 / 容器部署，免改 config.json）。
+	if v := os.Getenv("WB2A_TUNNEL_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Tunnel.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_TUNNEL_MODE"); v != "" {
+		c.Tunnel.Mode = v
+	}
+	if v := os.Getenv("WB2A_TUNNEL_TOKEN"); v != "" {
+		c.Tunnel.Token = v
+	}
+	if v := os.Getenv("WB2A_TUNNEL_BINARY"); v != "" {
+		c.Tunnel.Binary = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -567,6 +806,12 @@ func (c *Config) normalize() error {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+	// 自动修重试间隔：负值无语义，钳 0（= 只试一次）。0 是合法值（只试一次），
+	// 故此处在归一时不回落默认——默认 5 分钟由 Default() 提供，用于区分
+	// 「未配置」与「显式设 0」。
+	if c.TLSAutoTrustRetryMinutes < 0 {
+		c.TLSAutoTrustRetryMinutes = 0
+	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
@@ -600,7 +845,113 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	if err := c.normalizeTrae(); err != nil {
+		return err
+	}
+	if err := c.normalizeTunnel(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// normalizeTunnel 补齐/校验 tunnel 段。
+//
+// 与 trae 段同样的取向：即便 Enabled 为 false 也把字段补成合法值，否则用户在
+// 面板里打开开关前看到的是一片空白。**不在这里校验 token 是否齐全**——那样配置
+// 一脏整个进程就起不来，用户反而进不了面板去改；缺失交由 tunnel.Manager 在启动
+// 时报错、由面板显示出来。
+func (c *Config) normalizeTunnel() error {
+	switch strings.ToLower(strings.TrimSpace(c.Tunnel.Mode)) {
+	case "", "quick":
+		c.Tunnel.Mode = "quick"
+	case "token":
+		c.Tunnel.Mode = "token"
+	default:
+		return fmt.Errorf("tunnel.mode %q 不支持（可选 quick / token）", c.Tunnel.Mode)
+	}
+	c.Tunnel.Token = strings.TrimSpace(c.Tunnel.Token)
+	c.Tunnel.Binary = strings.TrimSpace(c.Tunnel.Binary)
+	c.Tunnel.Target = strings.TrimSpace(c.Tunnel.Target)
+	// Target 空 = 指向本机监听端口。listen 形如 ":7863" / "127.0.0.1:7863"，
+	// 取最后一个冒号后的端口；取不到就留空，由 Manager 回落到 listen 原值。
+	if c.Tunnel.Target == "" {
+		if i := strings.LastIndex(c.Listen, ":"); i >= 0 {
+			if port := strings.TrimSpace(c.Listen[i+1:]); port != "" {
+				c.Tunnel.Target = "http://127.0.0.1:" + port
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeTrae 补齐/校验 trae 段（仅 Enabled 为 true 时才做实质校验）。
+//
+// 关闭状态下也做「目录/状态文件回落 + duration 解析」：面板配置页要能展示一份
+// 合法的 trae 段（否则用户打开开关前看到的是空白），且解析失败应尽早暴露而不是
+// 等到启用那一刻才报错。
+func (c *Config) normalizeTrae() error {
+	// AuthDir 空 = 复用主 auth_dir：两侧 glob（workbuddy*.json / trae-*.json）
+	// 不重叠，同目录互不污染。显式配置即完全独立。
+	if strings.TrimSpace(c.Trae.AuthDir) == "" {
+		c.Trae.AuthDir = c.AuthDir
+	}
+	// StateFile 空 = 主 state 同目录的 state-trae.json（跟随 state_file 迁移）。
+	if strings.TrimSpace(c.Trae.StateFile) == "" {
+		c.Trae.StateFile = stateSibling(c.StateFile, "state-trae.json")
+	}
+	if strings.TrimSpace(c.Trae.DefaultModel) == "" {
+		c.Trae.DefaultModel = "glm-5.2"
+	}
+	// CallbackPort：空 → 默认 18080；显式 "0" → 不起回调 server（纯手动粘贴模式）。
+	if strings.TrimSpace(c.Trae.CallbackPort) == "" {
+		c.Trae.CallbackPort = "18080"
+	}
+	if len(c.Trae.Schedule.CheckinHours) == 0 {
+		c.Trae.Schedule.CheckinHours = []int{9}
+	}
+	if len(c.Trae.Schedule.RefreshHours) == 0 {
+		c.Trae.Schedule.RefreshHours = []int{3}
+	}
+	if err := checkHourRange("trae.schedule.checkin_hours", "trae.schedule.checkin_enabled", c.Trae.Schedule.CheckinHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("trae.schedule.refresh_hours", "trae.schedule.refresh_enabled", c.Trae.Schedule.RefreshHours); err != nil {
+		return err
+	}
+	if c.Trae.Cooldown.ErrThreshold <= 0 {
+		c.Trae.Cooldown.ErrThreshold = 3
+	}
+	if c.Trae.Upstream.TimeoutSeconds <= 0 {
+		c.Trae.Upstream.TimeoutSeconds = 120
+	}
+	var err error
+	if c.TraePlanCreditDur, err = parseDurDefault(c.Trae.Cooldown.PlanCredit, "trae.cooldown.plan_credit", 12*time.Hour); err != nil {
+		return err
+	}
+	if c.TraeSoftRateDur, err = parseDurDefault(c.Trae.Cooldown.SoftRate, "trae.cooldown.soft_rate", 60*time.Second); err != nil {
+		return err
+	}
+	if c.TraeErrCooldownDur, err = parseDurDefault(c.Trae.Cooldown.ErrCooldown, "trae.cooldown.err_cooldown", 10*time.Minute); err != nil {
+		return err
+	}
+	if c.TraeRefreshSkewDur, err = parseDurDefault(c.Trae.RefreshSkew, "trae.refresh_skew", 24*time.Hour); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parseDurDefault 解析 duration 字段：空串回落到 def（并写回字段，供面板展示），
+// 非法值报错并带上字段名（fail fast，不静默回落掩盖配置错误）。
+func parseDurDefault(raw, field string, def time.Duration) (time.Duration, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	return d, nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
@@ -671,6 +1022,59 @@ func splitCSV(s string) []string {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// autoTrustHosts 出站 TLS 自动修的目标主机清单。
+//
+// 显式配置 tls_auto_trust_hosts 即完全采用它（不与内置清单合并）——用户给出清单
+// 就是明确意图，合并会让「我只想修这一个」的诉求失效，也会无谓扩大 TOFU 作用面。
+//
+// 内置默认只含本服务本来就要访问的腾讯域名：CN 上游 copilot.tencent.com，以及
+// global 上游 base。global.enabled=false 时不加 global 主机——纯 CN 部署不该为一个
+// 永不访问的主机反复探测（每轮都会 Unreachable，白等一轮重试间隔）。
+func (c *Config) autoTrustHosts() []string {
+	if len(c.TLSAutoTrustHosts) > 0 {
+		return dedupeHosts(c.TLSAutoTrustHosts)
+	}
+	out := []string{"copilot.tencent.com"}
+	if c.Global.Enabled {
+		chat := strings.TrimSpace(c.Global.ChatBase)
+		if chat == "" {
+			chat = "https://www.workbuddy.ai"
+		}
+		out = append(out, hostOfURL(chat))
+		if bill := strings.TrimSpace(c.Global.BillingBase); bill != "" {
+			out = append(out, hostOfURL(bill))
+		}
+	}
+	return dedupeHosts(out)
+}
+
+// hostOfURL 从 URL 取主机名（带端口则保留）；非 http(s) 或解析失败返回空串。
+func hostOfURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	return u.Host
+}
+
+// dedupeHosts 去空白、去重、保持原顺序。
+func dedupeHosts(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, h := range in {
+		h = strings.TrimSpace(h)
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
 	}
 	return out
 }

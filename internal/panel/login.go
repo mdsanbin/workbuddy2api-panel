@@ -49,7 +49,11 @@ func loginEndpoints(realm string) (state, token, account, origin string) {
 }
 
 // loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
-var loginHTTP = &http.Client{Timeout: 30 * time.Second}
+//
+// Transport 用可热替换的 loginTransport（见 tls.go）：出站 TLS 信任池会在运行期被
+// 「自动修」替换（见 tlsauto.go），固定住这一个 RoundTripper 才不会与并发的 Do
+// 数据竞争。未注入自定义信任池时它回落 http.DefaultTransport，行为与改动前一致。
+var loginHTTP = &http.Client{Timeout: 30 * time.Second, Transport: loginTransport}
 
 func commonHeaders(req *http.Request, origin string) {
 	req.Header.Set("Content-Type", "application/json")
@@ -94,7 +98,9 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := loginHTTP.Do(req)
+	// 走 doWithTLSHeal：撞上「证书不受信任」时现场自动修一次信任并重试
+	//（见 tlsauto.go）——用户不必先手动去诊断页点「信任」。
+	resp, err := doWithTLSHeal(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -130,7 +136,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	epState, _, _, origin := loginEndpoints(realm)
 	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
+		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v%s", status, err, tlsErrorHint(err)))
 		return
 	}
 	var st struct {

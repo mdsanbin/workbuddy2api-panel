@@ -299,6 +299,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #logBox .ln.e { color: var(--bad); }
 #logBox .ln.w { color: var(--warn); }
 #view-logs .box > header { flex-wrap: wrap; }
+/* Trae 视图：内嵌它自带的管理页（同源 iframe）。高度按视口扣掉顶栏与内边距，
+   并留 min-height 兜底，避免手机上出现「iframe 内 + 页面」双重滚动条。
+   不设背景色：里面的页面自带底色，跟随其自身主题。 */
+.trae-frame { width: 100%; height: calc(100vh - 200px); min-height: 400px; border: 0;
+  border-radius: 8px; display: block; background: transparent; }
 #reqSummary, #reqNote { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #reqSummary { flex: 1 1 320px; }
 #reqNote { flex: 0 1 260px; text-align: right; }
@@ -601,6 +606,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
+      <li><a href="#trae" data-view="trae">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M9.2 1.8 3.6 9h3l-.6 5.2L11.8 7h-3z"/></svg>
+        Trae 账号</a></li>
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
@@ -623,6 +631,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
       <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+      <button class="xs danger" id="btnShutdown" style="margin-top:10px;width:100%" title="停止网关进程（模块部署下不会自动恢复）">停止服务</button>
     </div>
   </nav>
 
@@ -751,6 +760,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="">全部域</option>
             <option value="cn">国内版 CN</option>
             <option value="global">国际版 Global</option>
+            <option value="trae">Trae</option>
           </select>
           <select id="mdCap" aria-label="按能力筛选">
             <option value="">全部能力</option>
@@ -1072,6 +1082,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
 
         <div class="box">
+          <header><h3>远程访问（Cloudflare Tunnel）
+            <span class="hint">按需开启 · 纯出站连接，不改本机网络配置</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="tnState">—</span></header>
+          <div class="pad">
+            <div class="grid2">
+              <label class="fld"><span class="lb">隧道模式</span>
+                <select name="tunnel_mode">
+                  <option value="quick">quick · 临时公网地址（无需账号）</option>
+                  <option value="token">token · 具名隧道（地址固定）</option>
+                </select>
+                <span class="hint">quick 的地址每次启动都会变</span></label>
+              <label class="fld"><span class="lb">cloudflared 路径</span>
+                <input name="tunnel_binary" placeholder="留空 = 从 PATH 查找">
+                <span class="hint">未安装时见下方说明</span></label>
+            </div>
+            <label class="fld"><span class="lb">隧道凭据 Token</span>
+              <input name="tunnel_token" type="password" placeholder="token 模式必填">
+              <span class="hint">Cloudflare Zero Trust → Networks → Tunnels 创建后复制</span></label>
+            <label class="fld"><span class="lb">回源地址</span>
+              <input name="tunnel_target" placeholder="留空 = 自动指向本机监听端口">
+              <span class="hint">隧道把公网请求转发到这个本地地址</span></label>
+            <div class="switch"><span class="lb">启用隧道</span>
+              <input type="checkbox" name="tunnel_enabled"></div>
+            <div class="hint" id="tnDetail" style="margin-top:6px"></div>
+          </div>
+        </div>
+
+        <div class="box">
           <header><h3>日志</h3></header>
           <div class="pad">
             <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
@@ -1145,6 +1184,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnLogPin">自动滚动：开</button>
         </header>
         <pre id="logBox"></pre>
+      </div>
+    </section>
+
+    <!-- Trae（TRAE Work / IDE）账号池 -->
+    <section class="view" id="view-trae" hidden>
+      <div class="box">
+        <header>
+          <h3>Trae 账号池 <span class="hint">TRAE Work / IDE 的独立账号池，与 WorkBuddy 账号各自记账、互不影响</span></h3>
+          <span class="grow"></span>
+          <button class="xs" id="btnTraeOpen" type="button">新窗口打开</button>
+          <button class="xs" id="btnTraeReload" type="button">重新载入</button>
+        </header>
+        <iframe id="traeFrame" class="trae-frame" title="Trae 账号管理" referrerpolicy="same-origin"></iframe>
       </div>
     </section>
   </div>

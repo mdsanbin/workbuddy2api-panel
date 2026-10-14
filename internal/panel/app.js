@@ -29,6 +29,10 @@ function applyTheme() {
     ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
     : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
   $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
+  // Trae 管理页在 iframe 里，改不到它的 DOM —— 主题变了就重载它一次。
+  // 首次加载时 src 还是空的，这里不会误触发。
+  const tf = $('traeFrame');
+  if (tf && tf.getAttribute('src')) tf.src = '/trae/admin?theme=' + eff + '&_=' + Date.now();
 }
 addEventListener('change', applyTheme);
 $('btnTheme').onclick = () => {
@@ -338,7 +342,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志', trae: 'Trae 账号' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -351,6 +355,7 @@ function go(v) {
   if (v === 'packages') loadPackages();
   if (v === 'accounts') loadExpiry();
   if (v === 'taskscenter') reattachQueueView();
+  if (v === 'trae') loadTrae();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -363,6 +368,84 @@ setTimeout(() => {
   const hash = (location.hash || '#accounts').slice(1);
   go(hash in TITLES ? hash : 'accounts');
 }, 0);
+
+/* ── Trae 账号（内嵌独立管理页） ──────────────────────────────────────
+   面板与 Trae 管理页同源，localStorage 天然共享：把面板已保存的密钥同步到 Trae 页
+   使用的那把键，用户在 iframe 里就不必二次输入。密钥只在同源页面之间流转。
+   iframe 的 src 延迟到首次切进本视图时才赋值，没用到 Trae 的部署不会白跑一次请求。 */
+function loadTrae(reload) {
+  const f = $('traeFrame');
+  if (!f) return;
+  syncTraeKey();
+  // 主题经 URL 参数告诉 iframe：跨文档读不到外层的 data-theme，只能显式传。
+  const base = '/trae/admin?theme=' + effTheme();
+  if (reload) { f.src = base + '&_=' + Date.now(); return; }
+  if (!f.getAttribute('src')) f.src = base;
+}
+function syncTraeKey() {
+  const k = localStorage.getItem(LS_KEY);
+  if (k) localStorage.setItem('tw2a_admin_key', k);
+}
+/* Trae 管理页把自身内容高度报上来，iframe 按内容长高 —— 否则两层滚动，
+   账号表永远「显示不全」。origin 与 source 双重校验，只信自家 iframe。 */
+addEventListener('message', ev => {
+  const f = $('traeFrame');
+  if (!f || ev.origin !== location.origin || ev.source !== f.contentWindow) return;
+  if (ev.data && ev.data.type === 'wb2a-trae-height') {
+    f.style.height = Math.max(420, Math.min(ev.data.h + 24, 6000)) + 'px';
+  }
+});
+const btnTraeReload = $('btnTraeReload'), btnTraeOpen = $('btnTraeOpen');
+if (btnTraeReload) btnTraeReload.onclick = () => loadTrae(true);
+if (btnTraeOpen) btnTraeOpen.onclick = () => { syncTraeKey(); window.open('/trae/admin', '_blank', 'noopener'); };
+
+/* ── 停止服务 ──────────────────────────────────────────────────────────
+   面板里唯一会让服务本身消失的操作：二次确认文案必须写清「怎么再起来」——
+   KernelSU 模块部署下停止后不会自恢复，用户得知道去哪儿重新拉起。
+   成功与「连接被断」都算已停止：服务退得够快时 fetch 会直接抛错，而那一刻服务
+   其实已经停了，报成失败只会吓用户一跳。真正的失败是 API 明确回 401 / 501。 */
+async function shutdownService() {
+  if (!confirm('停止网关服务？\n\n'
+    + '· 面板与 /v1 API 会立即不可用；正在处理的请求会等它跑完再退出。\n'
+    + '· KernelSU 模块部署：停止后不会自动恢复，需用模块的「操作」按钮或重启设备重新拉起。\n'
+    + '· 直接运行可执行文件的场景：重新双击即可。\n\n'
+    + '确认停止？')) return;
+
+  const btn = $('btnShutdown');
+  if (btn) { btn.disabled = true; btn.textContent = '正在停止…'; }
+
+  // 这里直连 fetch 而不走 api()：成败必须看 HTTP 状态码——「服务退得太快、连接被断」
+  // 与「接口明确拒绝」在 api() 里都表现为抛异常，靠错误文案区分太脆（改一句话就失灵）。
+  let realErr = '';
+  try {
+    const k = localStorage.getItem(LS_KEY);
+    const r = await fetch('/panel/api/shutdown', {
+      method: 'POST',
+      headers: k ? { 'Authorization': 'Bearer ' + k } : {},
+    });
+    if (r.status !== 200) {
+      const d = await r.json().catch(() => ({}));
+      realErr = (d && d.error) || ('HTTP ' + r.status);
+      if (r.status === 401) openKey();
+    }
+  } catch (e) {
+    /* 连接被断 = 服务已按预期退出，不算失败 */
+  }
+  if (realErr) {
+    if (btn) { btn.disabled = false; btn.textContent = '停止服务'; }
+    alert('停止失败：' + realErr);
+    return;
+  }
+
+  if (refTimer) { clearInterval(refTimer); refTimer = null; }
+  const st = $('navState'); if (st) st.textContent = '已停止';
+  const pulse = $('navPulse'); if (pulse) pulse.style.opacity = '.35';
+  if (btn) btn.textContent = '服务已停止';
+}
+{
+  const b = $('btnShutdown');
+  if (b) b.onclick = shutdownService;
+}
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 function renderAccounts(list) {
@@ -707,7 +790,11 @@ function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
   const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning
+      ? (m.default_effort ? '固定档 · 默认 ' + esc(m.default_effort) : '支持思考 · 仅开/关')
+      // reasoning_known 只有 Trae 侧条目会带：上游没声明的显示「—」，
+      // 而不是把「未知」误报成「不支持思考」（WB 条目无此字段，行为不变）。
+      : (m.reasoning_known === false ? '—' : '不支持思考')) + '</span>';
   // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');
@@ -986,6 +1073,9 @@ const CFG_MAP = {
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
+  tunnel_enabled: ['tunnel', 'enabled'], tunnel_mode: ['tunnel', 'mode'],
+  tunnel_token: ['tunnel', 'token'], tunnel_binary: ['tunnel', 'binary'],
+  tunnel_target: ['tunnel', 'target'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -998,13 +1088,42 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file',
+  'tunnel_token', 'tunnel_binary', 'tunnel_target']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
   for (let i = 0; i < path.length - 1; i++) { if (typeof o[path[i]] !== 'object' || o[path[i]] === null) o[path[i]] = {}; o = o[path[i]]; }
   o[path[path.length - 1]] = val;
+}
+
+/* 隧道状态：只读展示。开关本身走配置保存（后端保存后立即 Apply），
+   这里只把运行态与公网地址显示出来——没有 cloudflared 时给可操作的说明，
+   而不是让用户对着一个打不开的开关猜原因。 */
+async function loadTunnel() {
+  const st = $('tnState'), dt = $('tnDetail');
+  if (!st || !dt) return;
+  try {
+    const d = await api('tunnel');
+    if (d.running) {
+      st.textContent = '运行中';
+      dt.textContent = d.url ? ('公网地址：' + d.url) : '隧道已启动，公网地址申请中…';
+    } else if (d.enabled) {
+      st.textContent = '未运行';
+      dt.textContent = d.err || '正在启动…';
+    } else {
+      st.textContent = '已关闭';
+      dt.textContent = d.installed
+        ? '按需开启：勾选下方「启用隧道」并保存，即会拉起 cloudflared。'
+        : '未检测到 cloudflared，先装它再开这个开关 —— Windows 可执行 '
+          + 'winget install --id Cloudflare.cloudflared，或从 GitHub Release 下载 '
+          + 'cloudflared-windows-amd64.exe 并改名为 cloudflared.exe 放进 PATH。';
+    }
+  } catch (e) {
+    st.textContent = '—';
+    dt.textContent = '状态读取失败：' + e.message;
+  }
 }
 
 async function loadConfig() {
@@ -1023,6 +1142,7 @@ async function loadConfig() {
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
+    loadTunnel();
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
 function collectConfig() {
@@ -1099,6 +1219,7 @@ $('cfgForm').onsubmit = async ev => {
     if (k) localStorage.setItem(LS_KEY, k);
     loadConfig();
     loadOverview(true);
+    setTimeout(loadTunnel, 1500); // 隧道拉起是异步的，稍后再确认一次状态
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
