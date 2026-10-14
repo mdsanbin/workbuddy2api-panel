@@ -85,11 +85,6 @@ type Config struct {
 	// 这里只做状态展示：「是否启用」本身是配置项，开关走 SaveConfig →
 	// main 侧调 Apply 热生效，避免出现配置与进程状态对不上的窗口。
 	Tunnel *tunnel.Manager
-
-	// TraeModels 查 Trae 侧模型列表（nil = 该部署未启用 Trae）。
-	// 返回的条目直接进 /panel/api/models 的结果集，id 形如 trae:<name>——
-	// 与 cn: / global: 并列，前端「模型与档位」按前缀筛选，渲染侧无需改动。
-	TraeModels func() ([]map[string]any, error)
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -387,17 +382,6 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-		}
-	}
-
-	// Trae 侧（第三条产品线）：与 cn / global 并列展示，id 前缀 trae:。
-	// 与上面两域同样的取舍 —— 查不到只记错误串，不让整个列表 500。
-	if p.cfg.TraeModels != nil {
-		entries, err := p.cfg.TraeModels()
-		if err != nil {
-			fetchErrs = append(fetchErrs, "trae: "+err.Error())
-		} else {
-			out = append(out, entries...)
 		}
 	}
 

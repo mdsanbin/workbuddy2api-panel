@@ -49,7 +49,7 @@
   },
   "upstream": {
     "timeout_seconds": 120,
-    "header_timeout_seconds": 120,
+    "header_timeout_seconds": 300,
     "idle_timeout_seconds": 300,
     "user_agent": "",
     "client_version": "",
@@ -90,29 +90,6 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
-  },
-  "trae": {
-    "enabled": true,
-    "auth_dir": "",
-    "state_file": "",
-    "default_model": "glm-5.2",
-    "callback_port": "18080",
-    "schedule": {
-      "checkin_hours": [9],
-      "refresh_hours": [3],
-      "checkin_enabled": true,
-      "refresh_enabled": true
-    },
-    "cooldown": {
-      "plan_credit": "12h",
-      "soft_rate": "60s",
-      "err_threshold": 3,
-      "err_cooldown": "10m"
-    },
-    "upstream": {
-      "timeout_seconds": 120
-    },
-    "refresh_skew": "24h"
   },
   "tunnel": {
     "enabled": false,

@@ -2,7 +2,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,13 +43,6 @@ type Config struct {
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
-	// TraeModels Trae 侧模型条目（id 已带 trae: 前缀，与面板同款富字段）。
-	// nil = Trae 未启用。/v1/models 会一并列出，使客户端在主端点就能发现
-	// 并选用 Trae 池模型 —— 这就是「Trae 反代出来」的一半。
-	TraeModels func() []map[string]any
-	// TraeChat 把 trae: 前缀的对话请求转交 Trae handler 处理（另一半）。
-	// 返回 true = 已处理（响应已写出）；false = Trae 侧未启用，调用方兜底报错。
-	TraeChat func(w http.ResponseWriter, r *http.Request) bool
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -285,24 +277,6 @@ const (
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
-// stripTraePrefix 把请求体里的 model 从 trae:xxx 改回 xxx。
-// 解析/序列化失败时原样返回（宁可让上游报错，也不丢 body）。
-func stripTraePrefix(body []byte) []byte {
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
-	}
-	m, ok := obj["model"].(string)
-	if !ok || !strings.HasPrefix(m, "trae:") {
-		return body
-	}
-	obj["model"] = strings.TrimPrefix(m, "trae:")
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
-}
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -456,27 +430,6 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
-	// Trae 侧模型（trae: 前缀）：与 cn:/global: 并列进 /v1/models。
-	// 富字段从面板同款条目透出（上下文/输出/能力旗标），不编造没有的；
-	// Trae 上游不给 effort 分档，故不带 reasoning_*_effort 字段。
-	if h.cfg.TraeModels != nil {
-		for _, e := range h.cfg.TraeModels() {
-			entry := map[string]any{
-				"id":       e["id"],
-				"object":   "model",
-				"created":  1753600000,
-				"owned_by": "trae",
-			}
-			for _, k := range []string{"name", "context_length", "max_output_tokens",
-				"supports_reasoning", "reasoning_known", "supports_images",
-				"supports_tool_call", "is_default", "description"} {
-				if v, ok := e[k]; ok {
-					entry[k] = v
-				}
-			}
-			out = append(out, entry)
-		}
-	}
 	return out
 }
 
@@ -573,26 +526,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
-
-	// trae: 前缀 → 转交 Trae 池（双池统一入口：客户端一个 base_url + key 通吃）。
-	// body 已读走，重建 NopCloser 再转交 —— Trae handler 内部会自己再读一次。
-	// 外层 withAuth 已验过同一把 api_key，Trae 侧再验一次无害。
-	if strings.HasPrefix(peek.Model, "trae:") {
-		if h.cfg.TraeChat == nil {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-				"trae 侧未启用（config trae.enabled=false）")
-			return
-		}
-		// Trae 侧的 mapModel 只认裸模型名，转发前把 trae: 前缀从 body 里剥掉。
-		// 前缀是网关侧的路由协议，不该漏给上游。
-		body = stripTraePrefix(body)
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		if h.cfg.TraeChat(w, r) {
-			return
-		}
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "trae 侧未能处理该请求")
-		return
-	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -1157,6 +1090,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint := upstream.NoHealthyAccountHint()
+	// 超时场景的 hint 指向真实原因：此时池里可能还有健康号，沿用「没号可用」
+	// 的固定文案会误导排查方向。给出当前阈值与三条出路（重试 / 调大阈值 /
+	// 换非思考模型）。
+	if errors.Is(lastErr, errUpstreamTimeout) {
+		hint = fmt.Sprintf("upstream first-byte timeout (header_timeout_seconds=%d): the model likely spent too long reasoning before its first token; retry later, raise upstream.header_timeout_seconds, or use a non-thinking model",
+			int(h.cfg.Upstream.HeaderTimeout.Seconds()))
+	}
 	// upstreamMsgPassed 记录 error.message 是否已被上游原文占据：模型级阻塞分支
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false

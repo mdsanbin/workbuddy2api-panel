@@ -268,69 +268,6 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
-	// Trae TRAE SOLO（TraeWork）侧配置：与 WorkBuddy 完全平行的第二套账号池。
-	//
-	// 形态是「单进程双池」而不是「统一池」：两侧的凭证模型 / 上游协议 / 风控字段
-	// 都不同（Trae 侧是 x-machine-id + x-device-id 硬校验，WorkBuddy 侧是
-	// X-Device-Token），共用一个池等于把两套状态机揉在一起。这里让它们各自持有
-	// 独立的 auth 目录 / state 文件 / upstream client / 调度器，只在同一个二进制、
-	// 同一个 Web 面板和同一份配置里共存，接口面走 /trae/* 前缀与本体的 /v1/* 并列。
-	Trae struct {
-		// Enabled 是否装配 Trae 侧（缺省 true）。
-		// 关闭时不加载任何 Trae 账号、不注册 /trae/* 路由、不起 Trae 调度器。
-		//
-		// 为什么默认开：Trae 侧只在 auths/ 里存在 trae-*.json 时才有账号可加载，
-		// 没有凭证时它只是一个空池 + 一条 /trae/ 路由，成本可忽略；而默认关闭会让
-		// 用户导入凭证后还得再翻配置打开开关，多一道无谓的坎。要关显式写 false。
-		Enabled bool `json:"enabled"`
-
-		// AuthDir Trae 凭证目录（扫 trae-*.json）。空 = 复用主 auth_dir。
-		//
-		// 复用是安全的：两侧的 glob 模式不重叠（workbuddy*.json vs trae-*.json），
-		// 同一目录天然互不污染。默认取空值即是为了让用户把 trae-*.json 直接丢进
-		// 现有 auths/ 就能被识别，不必再记一个新目录。需要严格隔离时显式配本键。
-		AuthDir string `json:"auth_dir"`
-
-		// StateFile Trae 池状态文件。空 = 与主 state_file 同目录的 state-trae.json。
-		//
-		// 必须与 WorkBuddy 的 state.json 分开：两侧的持久化结构不同（Trae 池没有
-		// 熔断 / 连败降权 / 模型级冷却 / 成本台账这些字段），共用文件会让两边互相
-		// 把对方的键洗掉。
-		StateFile string `json:"state_file"`
-
-		// DefaultModel 客户端未指定 model 时的缺省模型。空 = 回落内置 glm-5.2。
-		DefaultModel string `json:"default_model"`
-
-		// CallbackPort Trae 网页登录的回调监听端口（监听 127.0.0.1）；"0" = 不起，
-		// 降级为「手动粘贴回调链接」。与主服务的端口独立，避免与其它登录流程抢占。
-		CallbackPort string `json:"callback_port"`
-
-		Schedule struct {
-			CheckinHours []int `json:"checkin_hours"` // [9]，空 = 回落默认
-			RefreshHours []int `json:"refresh_hours"` // [3]，空 = 回落默认
-			// CheckinEnabled/RefreshEnabled 显式禁用开关（缺省 true）。
-			// 语义同主 schedule：bool 缺省 true 保证老配置零影响，只有显式 false 才关。
-			CheckinEnabled bool `json:"checkin_enabled"`
-			RefreshEnabled bool `json:"refresh_enabled"`
-		} `json:"schedule"`
-
-		// Cooldown 冷却参数。Trae 侧的冷却语义比 WorkBuddy 简单，只有三类：
-		// 1005 plan 权益不足（长冷却）、429（短冷却）、连续错误（中冷却）。
-		Cooldown struct {
-			PlanCredit   string `json:"plan_credit"`   // "12h"
-			SoftRate     string `json:"soft_rate"`     // "60s"
-			ErrThreshold int    `json:"err_threshold"` // 3
-			ErrCooldown  string `json:"err_cooldown"`  // "10m"
-		} `json:"cooldown"`
-
-		Upstream struct {
-			TimeoutSeconds int `json:"timeout_seconds"` // 120
-		} `json:"upstream"`
-
-		// RefreshSkew token 预刷新窗口（缺省 24h）：Trae 的 access token 有效期短，
-		// 提前量给足，避免请求打到过期 token 上。空/非法回落默认。
-		RefreshSkew string `json:"refresh_skew"`
-	} `json:"trae"`
 
 	// Tunnel 按需开启的公网隧道（Cloudflare Tunnel）。
 	//
@@ -359,11 +296,6 @@ type Config struct {
 		Target string `json:"target"`
 	} `json:"tunnel"`
 
-	// Trae 解析后的 duration
-	TraePlanCreditDur  time.Duration `json:"-"`
-	TraeSoftRateDur    time.Duration `json:"-"`
-	TraeErrCooldownDur time.Duration `json:"-"`
-	TraeRefreshSkewDur time.Duration `json:"-"`
 
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
@@ -455,26 +387,6 @@ func Default() *Config {
 	// Binary 空 = 走 PATH 查找 cloudflared；Target 空 = 自动指向本机监听端口。
 	c.Tunnel.Enabled = false
 	c.Tunnel.Mode = "quick"
-
-	// Trae 侧：Enabled 缺省 true（开箱即用；要关显式写 false）。之所以敢默认开：
-	// Trae 侧只在 auths/ 里存在 trae-*.json 时才有账号可加载，没有凭证时它只是
-	// 一个空池 + 一条 /trae/ 路由，成本可忽略；默认关闭反而会让用户导入凭证后
-	// 还得再去翻配置打开开关。其余键给出与 trae2api-web 一致的推荐值。
-	// AuthDir 缺省空 = 复用主 auth_dir；StateFile 缺省空 = 主 state 同目录的
-	// state-trae.json（两者都在 normalizeTrae 里补齐）。
-	c.Trae.Enabled = true
-	c.Trae.DefaultModel = "glm-5.2"
-	c.Trae.CallbackPort = "18080"
-	c.Trae.Schedule.CheckinHours = []int{9}
-	c.Trae.Schedule.RefreshHours = []int{3}
-	c.Trae.Schedule.CheckinEnabled = true
-	c.Trae.Schedule.RefreshEnabled = true
-	c.Trae.Cooldown.PlanCredit = "12h"
-	c.Trae.Cooldown.SoftRate = "60s"
-	c.Trae.Cooldown.ErrThreshold = 3
-	c.Trae.Cooldown.ErrCooldown = "10m"
-	c.Trae.Upstream.TimeoutSeconds = 120
-	c.Trae.RefreshSkew = "24h"
 	return c
 }
 
@@ -658,22 +570,6 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_TLS_ALPN"); v != "" {
 		c.TLSALPN = v
 	}
-	// Trae 侧覆盖（KernelSU/Magisk 模块与容器部署惯用 env 注入，免改 config.json）。
-	// 只给最常按部署环境变化的三项；其余（排程/冷却）留在配置文件里。
-	if v := os.Getenv("WB2A_TRAE_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Trae.Enabled = b
-		}
-	}
-	if v := os.Getenv("WB2A_TRAE_AUTH_DIR"); v != "" {
-		c.Trae.AuthDir = v
-	}
-	if v := os.Getenv("WB2A_TRAE_STATE_FILE"); v != "" {
-		c.Trae.StateFile = v
-	}
-	if v := os.Getenv("WB2A_TRAE_DEFAULT_MODEL"); v != "" {
-		c.Trae.DefaultModel = v
-	}
 	// 停机标记：模块的 service.sh 在老版 config.json 缺少该键时用它兜底
 	// （见其注释）。显式配了 shutdown_marker 的部署不会被覆盖。
 	if v := os.Getenv("WB2A_SHUTDOWN_MARKER"); v != "" {
@@ -798,10 +694,12 @@ func (c *Config) normalize() error {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
-	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
-	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	// header（SSE 首字节）缺省 300s：深度思考模型的「响应头前推理」很容易超过
+	// 短 RPC 的 120s——若回落 TimeoutSeconds，思考类请求会高频撞
+	// upstream_timeout 503（实测 2026-10 用户反馈）。仍可显式覆盖。
+	// idle 缺省走内置大值。任务书约定：0 一律视为"未设置"走默认。
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
-		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
+		c.Upstream.HeaderTimeoutSeconds = 300
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
@@ -845,9 +743,6 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
-	if err := c.normalizeTrae(); err != nil {
-		return err
-	}
 	if err := c.normalizeTunnel(); err != nil {
 		return err
 	}
@@ -856,7 +751,7 @@ func (c *Config) normalize() error {
 
 // normalizeTunnel 补齐/校验 tunnel 段。
 //
-// 与 trae 段同样的取向：即便 Enabled 为 false 也把字段补成合法值，否则用户在
+// 与其他可选段同样的取向：即便 Enabled 为 false 也把字段补成合法值，否则用户在
 // 面板里打开开关前看到的是一片空白。**不在这里校验 token 是否齐全**——那样配置
 // 一脏整个进程就起不来，用户反而进不了面板去改；缺失交由 tunnel.Manager 在启动
 // 时报错、由面板显示出来。
@@ -884,61 +779,6 @@ func (c *Config) normalizeTunnel() error {
 	return nil
 }
 
-// normalizeTrae 补齐/校验 trae 段（仅 Enabled 为 true 时才做实质校验）。
-//
-// 关闭状态下也做「目录/状态文件回落 + duration 解析」：面板配置页要能展示一份
-// 合法的 trae 段（否则用户打开开关前看到的是空白），且解析失败应尽早暴露而不是
-// 等到启用那一刻才报错。
-func (c *Config) normalizeTrae() error {
-	// AuthDir 空 = 复用主 auth_dir：两侧 glob（workbuddy*.json / trae-*.json）
-	// 不重叠，同目录互不污染。显式配置即完全独立。
-	if strings.TrimSpace(c.Trae.AuthDir) == "" {
-		c.Trae.AuthDir = c.AuthDir
-	}
-	// StateFile 空 = 主 state 同目录的 state-trae.json（跟随 state_file 迁移）。
-	if strings.TrimSpace(c.Trae.StateFile) == "" {
-		c.Trae.StateFile = stateSibling(c.StateFile, "state-trae.json")
-	}
-	if strings.TrimSpace(c.Trae.DefaultModel) == "" {
-		c.Trae.DefaultModel = "glm-5.2"
-	}
-	// CallbackPort：空 → 默认 18080；显式 "0" → 不起回调 server（纯手动粘贴模式）。
-	if strings.TrimSpace(c.Trae.CallbackPort) == "" {
-		c.Trae.CallbackPort = "18080"
-	}
-	if len(c.Trae.Schedule.CheckinHours) == 0 {
-		c.Trae.Schedule.CheckinHours = []int{9}
-	}
-	if len(c.Trae.Schedule.RefreshHours) == 0 {
-		c.Trae.Schedule.RefreshHours = []int{3}
-	}
-	if err := checkHourRange("trae.schedule.checkin_hours", "trae.schedule.checkin_enabled", c.Trae.Schedule.CheckinHours); err != nil {
-		return err
-	}
-	if err := checkHourRange("trae.schedule.refresh_hours", "trae.schedule.refresh_enabled", c.Trae.Schedule.RefreshHours); err != nil {
-		return err
-	}
-	if c.Trae.Cooldown.ErrThreshold <= 0 {
-		c.Trae.Cooldown.ErrThreshold = 3
-	}
-	if c.Trae.Upstream.TimeoutSeconds <= 0 {
-		c.Trae.Upstream.TimeoutSeconds = 120
-	}
-	var err error
-	if c.TraePlanCreditDur, err = parseDurDefault(c.Trae.Cooldown.PlanCredit, "trae.cooldown.plan_credit", 12*time.Hour); err != nil {
-		return err
-	}
-	if c.TraeSoftRateDur, err = parseDurDefault(c.Trae.Cooldown.SoftRate, "trae.cooldown.soft_rate", 60*time.Second); err != nil {
-		return err
-	}
-	if c.TraeErrCooldownDur, err = parseDurDefault(c.Trae.Cooldown.ErrCooldown, "trae.cooldown.err_cooldown", 10*time.Minute); err != nil {
-		return err
-	}
-	if c.TraeRefreshSkewDur, err = parseDurDefault(c.Trae.RefreshSkew, "trae.refresh_skew", 24*time.Hour); err != nil {
-		return err
-	}
-	return nil
-}
 
 // parseDurDefault 解析 duration 字段：空串回落到 def（并写回字段，供面板展示），
 // 非法值报错并带上字段名（fail fast，不静默回落掩盖配置错误）。

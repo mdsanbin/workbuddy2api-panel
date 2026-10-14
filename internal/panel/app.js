@@ -29,10 +29,6 @@ function applyTheme() {
     ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
     : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
   $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
-  // Trae 管理页在 iframe 里，改不到它的 DOM —— 主题变了就重载它一次。
-  // 首次加载时 src 还是空的，这里不会误触发。
-  const tf = $('traeFrame');
-  if (tf && tf.getAttribute('src')) tf.src = '/trae/admin?theme=' + eff + '&_=' + Date.now();
 }
 addEventListener('change', applyTheme);
 $('btnTheme').onclick = () => {
@@ -342,7 +338,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志', trae: 'Trae 账号' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -355,7 +351,6 @@ function go(v) {
   if (v === 'packages') loadPackages();
   if (v === 'accounts') loadExpiry();
   if (v === 'taskscenter') reattachQueueView();
-  if (v === 'trae') loadTrae();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -368,36 +363,6 @@ setTimeout(() => {
   const hash = (location.hash || '#accounts').slice(1);
   go(hash in TITLES ? hash : 'accounts');
 }, 0);
-
-/* ── Trae 账号（内嵌独立管理页） ──────────────────────────────────────
-   面板与 Trae 管理页同源，localStorage 天然共享：把面板已保存的密钥同步到 Trae 页
-   使用的那把键，用户在 iframe 里就不必二次输入。密钥只在同源页面之间流转。
-   iframe 的 src 延迟到首次切进本视图时才赋值，没用到 Trae 的部署不会白跑一次请求。 */
-function loadTrae(reload) {
-  const f = $('traeFrame');
-  if (!f) return;
-  syncTraeKey();
-  // 主题经 URL 参数告诉 iframe：跨文档读不到外层的 data-theme，只能显式传。
-  const base = '/trae/admin?theme=' + effTheme();
-  if (reload) { f.src = base + '&_=' + Date.now(); return; }
-  if (!f.getAttribute('src')) f.src = base;
-}
-function syncTraeKey() {
-  const k = localStorage.getItem(LS_KEY);
-  if (k) localStorage.setItem('tw2a_admin_key', k);
-}
-/* Trae 管理页把自身内容高度报上来，iframe 按内容长高 —— 否则两层滚动，
-   账号表永远「显示不全」。origin 与 source 双重校验，只信自家 iframe。 */
-addEventListener('message', ev => {
-  const f = $('traeFrame');
-  if (!f || ev.origin !== location.origin || ev.source !== f.contentWindow) return;
-  if (ev.data && ev.data.type === 'wb2a-trae-height') {
-    f.style.height = Math.max(420, Math.min(ev.data.h + 24, 6000)) + 'px';
-  }
-});
-const btnTraeReload = $('btnTraeReload'), btnTraeOpen = $('btnTraeOpen');
-if (btnTraeReload) btnTraeReload.onclick = () => loadTrae(true);
-if (btnTraeOpen) btnTraeOpen.onclick = () => { syncTraeKey(); window.open('/trae/admin', '_blank', 'noopener'); };
 
 /* ── 停止服务 ──────────────────────────────────────────────────────────
    面板里唯一会让服务本身消失的操作：二次确认文案必须写清「怎么再起来」——
@@ -790,11 +755,7 @@ function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
   const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning
-      ? (m.default_effort ? '固定档 · 默认 ' + esc(m.default_effort) : '支持思考 · 仅开/关')
-      // reasoning_known 只有 Trae 侧条目会带：上游没声明的显示「—」，
-      // 而不是把「未知」误报成「不支持思考」（WB 条目无此字段，行为不变）。
-      : (m.reasoning_known === false ? '—' : '不支持思考')) + '</span>';
+    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
   // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');

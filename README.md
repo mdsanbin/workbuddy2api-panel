@@ -210,109 +210,6 @@ flowchart LR
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
-## 🔗 Trae 侧接入（TRAE Work / TRAE IDE）
-
-网关可以把 **Trae** 的账号也纳入同一个进程：**单二进制、单端口、单面板，两套账号池各自独立**。
-
-Trae 有两条独立产品线，两边都支持：**TRAE Work**（原 TRAE SOLO，AI 原生工作台，2026-06 改名）与 **TRAE IDE**（基于 VSCode 的代码编辑器，客户端内另有 SOLO 模式）。两者登录态互不相通、签发 token 的 OAuth ClientID 也不同，但对话走同一个上游。
-
-> 与 WorkBuddy 的关系：Trae 侧是同源姊妹实现（上游 `Sliverkiss/traework2api` 已删库，本仓库吸收其衍生版 `trae2api-web`）。两侧的凭证模型、上游协议与风控字段都不同，因此做成「各自成套、只共享进程与面板」，而不是合并成一个账号池。
-
-### 开关（缺省已开）
-
-**Trae 侧默认启用**，不用改配置——把凭证丢进 `auths/` 就能用。
-
-默认开是有意的：Trae 侧只在 `auths/` 里存在 `trae-*.json` 时才有账号可加载，没有凭证时它只是一个空池加一条 `/trae/` 路由，成本可以忽略；而默认关闭会让每个人导入完凭证还得再翻一遍配置去打开开关。
-
-要关掉就显式写：
-
-```json
-{
-  "trae": {
-    "enabled": false
-  }
-}
-```
-
-或不改文件，用 `WB2A_TRAE_ENABLED=0` 启动。**关闭时完全不加载**——不读账号、不注册路由、不起调度器。
-
-### 账号放哪
-
-Trae 凭证文件名形如 `trae-<uid>.json`，直接丢进 `auths/` 就能被识别——它与 WorkBuddy 的 `workbuddy*.json` 前缀不重叠，同一个目录互不干扰。需要物理隔离时用 `trae.auth_dir` 指到别的目录。字段沿用 `trae2api-web` 的两种磁盘形态（嵌套形 / 扁平形均可）：
-
-```json
-{
-  "auth": {
-    "accessToken": "...",
-    "refreshToken": "...",
-    "expiresAt": 0,
-    "domain": "trae.cn",
-    "apiHost": "https://api.trae.com.cn",
-    "machineId": "...",
-    "deviceId": "..."
-  },
-  "account": { "uid": "...", "enterpriseId": "", "nickname": "..." }
-}
-```
-
-### 接口
-
-| 端点 | 说明 |
-|---|---|
-| `POST /trae/v1/chat/completions` | OpenAI 兼容对话（流式 / 非流式） |
-| `GET /trae/v1/models` | Trae 侧模型列表 |
-| `GET /trae/status` | 账号状态（脱敏） |
-| `GET /trae/healthz` | 健康检查 |
-| `GET /trae/admin` | Trae 账号管理页（面板导航「Trae 账号」也指向它） |
-
-与 WorkBuddy 的 `/v1/*` 并列，鉴权共用同一把 `api_key`。做成独立端点而不是把模型混进同一个 `/v1/models`，是因为两侧的配额、冷却、日志口径不同——混在一起会让「这个模型该走谁的池」变成隐式约定。
-
-### ⚠️ Trae 特有的坑：9074 与设备号
-
-Trae 签到会校验 `x-device-id`，**必须是 Trae 客户端真实注册过的设备号**。否则接口一律返回：
-
-```json
-{"code": 9074, "message": "当前参与用户太多，请稍后再试"}
-```
-
-这句是**假文案**，与并发无关，真实原因是设备号没过校验。另外——**一个设备号一天只能签一个账号**，多账号就得有多个来自不同设备的真实设备号，这一条签到层面的自动化替代不了。
-
-### 配置项
-
-| 键 | 缺省 | 说明 |
-|---|---|---|
-| `trae.enabled` | `true` | 显式写 `false` 才关闭；关闭时完全不加载 |
-| `trae.auth_dir` | 空 = 复用主 `auth_dir` | Trae 凭证目录 |
-| `trae.state_file` | 空 = `data/state-trae.json` | 池状态（与本体 state 分开，结构不同） |
-| `trae.default_model` | `glm-5.2` | 未指定 model 时的缺省 |
-| `trae.callback_port` | `18080` | 网页登录回调监听；`"0"` = 不起（手动粘贴链接） |
-| `trae.schedule.checkin_hours` | `[9]` | 签到排程 |
-| `trae.schedule.refresh_hours` | `[3]` | token 预刷新排程 |
-| `trae.schedule.checkin_enabled` / `refresh_enabled` | `true` | 显式停用（关掉时保留已配的小时） |
-| `trae.cooldown.plan_credit` / `soft_rate` / `err_threshold` / `err_cooldown` | `12h` / `60s` / `3` / `10m` | 1005 权益不足 / 429 / 连续错误阈值 |
-| `trae.upstream.timeout_seconds` | `120` | 出站超时 |
-| `trae.refresh_skew` | `24h` | token 预刷新提前量（Trae token 有效期短，给足） |
-
-### 导入本机 Trae IDE 账号
-
-Trae IDE 没有可供搬运的凭证文件——登录态由客户端自己用 `tc` 格式加密存在
-
-```
-%APPDATA%\<产品名>\User\globalStorage\storage.json
-```
-
-里。网关可以把它解密后转成标准凭证入库：在 Trae 管理页点 **「从本机 IDE 导入」**，或调 `POST /trae/admin/api/import-ide`（body 可选 `{"storage_path": "..."}` 显式指定路径）。前提是网关与 IDE 装在同一台机器、且 IDE 已登录。
-
-导入后的账号 uid 带 `ide-` 前缀（形如 `ide-2486462976646380`），落盘为 `auths/trae-ide-<uid>.json`，与 TRAE Work 的 `trae-<uid>.json` 分开。前缀不是装饰：同一个 Trae 账号可以同时在两个客户端登录、各持一份互不相同的 token，不加前缀两条记录会在池里互相覆盖。
-
-几点要知道：
-
-- **导入一次即可**，之后 token 的刷新与写回走常规流程，不再回读 `storage.json`（避免与客户端抢写同一个文件）。
-- 在 IDE 里**重新登录后要再导入一次**——客户端会换成新的 refreshToken。
-- 两边的 OAuth ClientID 不同（IDE 是 `ono9krqynydwx5`，Work 是 `en1oxy7wnw8j9n`），刷新时按来源自动分流。
-- 对话上游是同一个（`trae-api-cn.mchost.guru`），但 `function` 取值不同（`inline_chat` vs `solo_work_lite`）且 IDE 需要每请求唯一的 `x-request-id` / `session_id`，均已按来源自动适配。
-- 国际版（Trae SG）的 `storage.json` 该字段是明文 JSON，也一并支持。
-
 ## 快速开始
 
 ### 环境要求
@@ -701,11 +598,10 @@ http://127.0.0.1:7863/panel/
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
-| **Trae 账号** | 内嵌 TRAE Work / TRAE IDE 的账号管理页（同源 iframe，风格与主面板一致、跟随明暗主题）：**单表**展示账号与积分（剩余 / 已用 / 总量、权益包数）、今日签到状态，另有顶部统计条；支持导入（粘贴回调链接 / 本机 IDE）、网页登录、**单号与一键签到**（串行执行，规避设备号风控）、**批量刷新 token**、启用停用、凭证预览与删除 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
-| **模型与档位** | 实时查询上游（含 **Trae 侧**，域筛选里选「Trae」即可，模型 id 为 `trae:` 前缀）：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
+| **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）、远程访问（Cloudflare Tunnel，按需开启） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动 |
 
@@ -770,7 +666,7 @@ http://127.0.0.1:7863/panel/
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-src 'self'` 只放行同源 iframe——面板的 Trae 页内嵌管理页要用，缺了它会回落到 `default-src` 而把 iframe 整个拦掉，`frame-ancestors 'none'` 禁被嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
+**安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-src 'self'` 只放行同源 iframe，`frame-ancestors 'none'` 禁被嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
 **鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
@@ -867,12 +763,11 @@ http://127.0.0.1:7863/panel/
 **两条硬约束决定了它只能这么挂：**
 
 1. **必须挂在某个域名的根路径上**，不能挂 `/wb2api/` 这类子路径。网关路由全是绝对路径
-   （`/v1/*`、`/panel/*`、`/trae/*`），且没有 `base_path` 配置项——面板前端的请求写死为
+   （`/v1/*`、`/panel/*`），且没有 `base_path` 配置项——面板前端的请求写死为
    `fetch('/panel/api/...')`，一旦挂在子路径就会打到站点根、全部 404。
    想用前缀区分，请改用**子域名**（`wb2api.example.com`）。
-2. **`/panel/` 与 `/trae/` 必须同源**（同 scheme + host + port）。「Trae 账号」页是用
-   同源 `<iframe>` 内嵌 `/trae/admin` 的：面板 CSP 声明 `frame-src 'self'`、Trae 页声明
-   `frame-ancestors 'self'`。**换端口也不行**（端口不同即不同 origin），iframe 会被拦成空白页。
+2. **`/panel/` 必须同源**（同 scheme + host + port）：面板声明了同源 CSP
+   （`frame-src 'self'`、`frame-ancestors 'self'`）。**换端口也不行**（端口不同即不同 origin）。
 
 **反代层要设置的六件事：**
 
@@ -885,13 +780,8 @@ http://127.0.0.1:7863/panel/
 | `proxy_http_version 1.1` + `Connection ""` | 配合 upstream `keepalive`，避免每个请求重开连接 |
 | HTTP → HTTPS 301 | 网关无内置 TLS，明文端口不要让它在公网可达 |
 
-⚠️ **不要在反代层添加 `X-Frame-Options` 或 CSP**——面板与 Trae 管理页各自已经发了正确的头，
-在外面再叠一层 `DENY` 会直接打死「Trae 账号」页（iframe 一片空白）。
-
-**关于 18080 回调端口**：Trae 侧启用时，网关会额外监听 `127.0.0.1:18080` 承接网页登录的
-OAuth 回调（`/authorize`）。它是给**本机浏览器**跳转用的，**不要暴露到公网**，也不必写进反代规则。
-副作用：从远端经反代访问面板时，「Trae 网页登录」拿不到回调（`127.0.0.1` 指向你自己的设备），
-此时请改用「导入本机 IDE 账号」或手动粘贴凭证。
+⚠️ **不要在反代层添加 `X-Frame-Options` 或 CSP**——面板自己已经发了正确的头，
+在外面再叠一层会直接打死面板页面。
 
 ### 远程访问隧道（Cloudflare Tunnel，按需开启）
 

@@ -287,7 +287,8 @@ func TestBadBreakerCooldown(t *testing.T) {
 }
 
 func TestUpstreamTimeoutDefaults(t *testing.T) {
-	// 默认：header 回落 timeout，idle 回落 300。
+	// 默认：header 独立默认 300（思考模型「响应头前推理」常超 120s，
+	// 回落 timeout 会高频撞 upstream_timeout），idle 回落 300。
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -295,16 +296,17 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 	if c.Upstream.TimeoutSeconds != 120 {
 		t.Errorf("timeout_seconds=%d want 120", c.Upstream.TimeoutSeconds)
 	}
-	if c.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Errorf("header_timeout_seconds=%d want fallback 120", c.Upstream.HeaderTimeoutSeconds)
+	if c.Upstream.HeaderTimeoutSeconds != 300 {
+		t.Errorf("header_timeout_seconds=%d want default 300", c.Upstream.HeaderTimeoutSeconds)
 	}
 	if c.Upstream.IdleTimeoutSeconds != 300 {
 		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
 	}
 }
 
-func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
-	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
+func TestUpstreamHeaderIndependentDefault(t *testing.T) {
+	// 只设 timeout_seconds：header 仍是独立默认 300（不回落同值——短 RPC 的
+	// 120s/60s 不适合做 SSE 首字节上限），idle 回落 300。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
 	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
@@ -312,8 +314,8 @@ func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Upstream.HeaderTimeoutSeconds != 60 {
-		t.Errorf("header_timeout_seconds=%d want fallback 60", c.Upstream.HeaderTimeoutSeconds)
+	if c.Upstream.HeaderTimeoutSeconds != 300 {
+		t.Errorf("header_timeout_seconds=%d want default 300", c.Upstream.HeaderTimeoutSeconds)
 	}
 	if c.Upstream.IdleTimeoutSeconds != 300 {
 		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)

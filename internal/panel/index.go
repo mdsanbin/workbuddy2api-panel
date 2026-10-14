@@ -35,7 +35,7 @@ var mobileJS []byte
 //     允许内联样式不会导致脚本执行；仍禁止外部样式域与 @import 外链。
 //   - connect-src 'self'        前端 fetch 只能打本服务
 //   - img-src 'self' data:      图标/内联图
-//   - frame-src 'self'          「Trae 账号」页用同源 iframe 内嵌 Trae 管理页。
+
 //     这条不能省：CSP 里 frame-src 未声明时回落到 default-src，而它是 'none' →
 //     iframe 被整个拦掉，表现为页面一片空白（控制台报 CSP 违规）。
 //   - form-action 'none'        页面无表单提交目标（配置页是 JS 提交）
