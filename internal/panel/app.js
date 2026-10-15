@@ -371,7 +371,7 @@ setTimeout(() => {
 let lanTimerStarted = false;
 async function loadLan() {
   try {
-    const d = await apiGet('lan');
+    const d = await api('lan');
     const ips = d.ips || [];
     const prim = ips.find(x => x.primary) || ips[0];
     const el = $('lanPrimary');

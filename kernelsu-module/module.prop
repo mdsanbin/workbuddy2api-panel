@@ -1,6 +1,6 @@
 id=workbuddy2api
 name=WorkBuddy2API 网关
-version=1.21.2
-versionCode=12102
+version=1.21.3
+versionCode=12103
 author=mdsanbin
 description=把 WorkBuddy / CodeBuddy / Trae 账号转成 OpenAI 兼容 API 的多账号网关，面板 http://127.0.0.1:7863/panel/
