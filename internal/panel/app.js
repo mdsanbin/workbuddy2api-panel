@@ -345,7 +345,7 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
-  if (v === 'config') loadConfig();
+  if (v === 'config') { loadConfig(); loadLan(); }
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
@@ -363,6 +363,47 @@ setTimeout(() => {
   const hash = (location.hash || '#accounts').slice(1);
   go(hash in TITLES ? hash : 'accounts');
 }, 0);
+
+/* ── 局域网访问地址（配置页，实时轮询） ────────────────────────────────
+   换网络后本机 IP 会变：后端每次请求实时枚举网卡（UDP dial 查默认路由），
+   前端 15s 轮询 + 页面隐藏时暂停。http 环境下 navigator.clipboard 不可用，
+   复制走 execCommand。 */
+let lanTimerStarted = false;
+async function loadLan() {
+  try {
+    const d = await apiGet('lan');
+    const ips = d.ips || [];
+    const prim = ips.find(x => x.primary) || ips[0];
+    const el = $('lanPrimary');
+    if (prim) {
+      const url = 'http://' + prim.addr + ':' + d.port + '/panel/';
+      el.value = url;
+      el.dataset.url = url;
+      $('lanNote').textContent = '网卡 ' + (prim.iface || '?');
+    } else {
+      el.value = '';
+      el.dataset.url = '';
+      $('lanNote').textContent = '未检测到局域网网卡';
+    }
+    $('lanList').innerHTML = ips.map(x =>
+      (x.primary ? '★ ' : '· ') + x.addr + '　' + esc(x.iface) + (x.primary ? '（默认）' : '')
+    ).join('<br>') || '<span style="color:var(--ink-3)">未检测到</span>';
+  } catch {}
+}
+const btnLanCopy = $('btnLanCopy');
+if (btnLanCopy) btnLanCopy.onclick = () => {
+  const el = $('lanPrimary');
+  if (!el.dataset.url) return;
+  el.select();
+  document.execCommand('copy');
+  el.blur();
+  btnLanCopy.textContent = '已复制';
+  setTimeout(() => { btnLanCopy.textContent = '复制'; }, 1200);
+};
+if (!lanTimerStarted) {
+  lanTimerStarted = true;
+  setInterval(() => { if (view === 'config' && !document.hidden) loadLan(); }, 15000);
+}
 
 /* ── 停止服务 ──────────────────────────────────────────────────────────
    面板里唯一会让服务本身消失的操作：二次确认文案必须写清「怎么再起来」——

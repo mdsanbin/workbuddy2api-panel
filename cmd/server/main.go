@@ -33,7 +33,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系 + 面板停机），透出到 /panel/api/overview。
-const appVersion = "1.20.1-panel"
+const appVersion = "1.20.2-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -334,8 +334,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// LAN 展示用端口：从 listen 尾部冒号后取数字（异常输入 0）。
+	lanPort := 0
+	for i := len(cfg.Listen) - 1; i >= 0; i-- {
+		if cfg.Listen[i] == ':' {
+			if n, e := parsePort(cfg.Listen[i+1:]); e == nil {
+				lanPort = n
+			}
+			break
+		}
+	}
 	pn := panel.New(panel.Config{
 		Pool:        p,
+		ListenPort:  lanPort,
 		Usage:       rec,
 		RequestLog:  requestLog,
 		Upstream:    up,
@@ -481,6 +492,27 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 			}
 		}
 	}
+}
+
+// parsePort 解析十进制端口号（0-65535）；非法输入返回错误。
+func parsePort(s string) (int, error) {
+	if s == "" {
+		return 0, errors.New("empty port")
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, errors.New("non-digit in port")
+		}
+		n = n*10 + int(s[i]-'0')
+		if n > 65535 {
+			return 0, errors.New("port out of range")
+		}
+	}
+	if n == 0 {
+		return 0, errors.New("port 0")
+	}
+	return n, nil
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL

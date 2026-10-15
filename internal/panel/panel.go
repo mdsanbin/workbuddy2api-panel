@@ -79,6 +79,10 @@ type Config struct {
 	// 直接跑二进制的场景没有守护进程，留空即可。
 	ShutdownMark string
 
+	// ListenPort 网关监听端口（main 从 cfg.Listen 解析注入；0 = 未知）。
+	// 「局域网访问」地址展示用：IP 由 lan 接口实时枚举，端口是静态值。
+	ListenPort int
+
 	// Tunnel 公网隧道（Cloudflare Tunnel）管理器，由 main 注入。
 	// nil = 该部署不支持隧道（/panel/api/tunnel 返回 501）。
 	//
@@ -176,6 +180,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/lan", p.withAuth(p.lan))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
